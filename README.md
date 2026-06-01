@@ -59,14 +59,27 @@ cargo run -p fleetterm        # the terminal (later)
 Rust · [GPUI](https://www.gpui.rs/) (UI) · [`alacritty_terminal`](https://docs.rs/alacritty_terminal) (VT engine) ·
 `portable-pty` · tokio · msgpack. Linux-first (Wayland/X11, Vulkan).
 
+## Status (2026-06-02)
+
+Daemon proven headless (**32 tests**); GPUI window **launches on Wayland, connects, and
+renders the live fleet**. Build: `cargo test` (daemon) green; `cargo run -p fleetd` + `cargo
+run -p fleetterm` for the cockpit. Needs `libxkbcommon-x11-dev` to link the UI.
+
+```bash
+target/debug/fleetd &                 # daemon (owns PTYs + state + autonomy)
+target/debug/examples/seed            # spawn a few demo sessions
+target/debug/fleetterm                # the cockpit window
+```
+
 ## Roadmap
 
-- **P0** GPUI window + one terminal session, hit the perf budget. *(in progress)*
-- **P1** Tabs · daemon owns PTYs · detach/reattach · command blocks (OSC 133).
-- **P2** Claude rich lane: hooks → state → fleet sidebar (read + approve/deny).
-- **P3** Autonomy engine + bulk actions + `@name`/`@all` composer. *(the leap)*
-- **P4** Multi-tool adapters · spawn presets · worktrees.
-- **P5** Tiled/Focus views · command palette · governance · polish.
+- **P0** GPUI window + native render — ✅ builds + opens + renders on this box.
+- **P1** daemon owns PTYs · grid-snapshot streaming — ✅ (detach/reattach + OSC 133 blocks pending).
+- **P2** Claude rich lane: hooks → state → fleet sidebar (read + approve/deny) — ✅.
+- **P3** Autonomy engine + pause/resume + per-session controls — ✅ (`@all` composer pending). *(the leap)*
+- **P4** Multi-tool heuristic adapters (codex/aider/gemini) — ✅ (spawn presets/worktrees pending).
+- **P5** Tiled/Focus views · `⌘K` palette · governance · polish — ⏳ next.
+- **next** real styled cell-grid terminal + keyboard→PTY input (see `docs/terminal-element-design.md`).
 - **P6** *(deferred)* inter-agent orchestration · remote/federation.
 
 UI look & feel: see the mockups in `~/fleetterm-v2.html` (canonical) and the gallery
