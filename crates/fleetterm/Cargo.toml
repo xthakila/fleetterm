@@ -1,6 +1,18 @@
 [package]
 name = "fleetterm"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fleetterm"
+path = "src/main.rs"
 
 [dependencies]
+protocol.workspace = true
+gpui = "0.2.2"
+anyhow.workspace = true
+tokio.workspace = true
+rmp-serde.workspace = true
+async-channel = "2"
+tracing.workspace = true

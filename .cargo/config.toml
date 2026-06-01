@@ -1,0 +1,4 @@
+# Cap build parallelism so large compiles (gpui's 600+ crate tree) don't saturate the
+# machine. 4 of 8 cores; combine with `nice`/`taskset` for background builds.
+[build]
+jobs = 4

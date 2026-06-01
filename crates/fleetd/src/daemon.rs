@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use portable_pty::CommandBuilder;
-use protocol::{Session, SessionId, SpawnSpec, State, Target, Tool};
+use protocol::{DecisionKind, Session, SessionId, SpawnSpec, State, Target, Tool};
 
 use crate::claude;
 use crate::pty::PtySession;
 use crate::registry::Registry;
+use crate::tools;
 
 pub struct Daemon {
     pub reg: Arc<Registry>,
@@ -82,6 +83,48 @@ impl Daemon {
             let _ = session.write_input(line.as_bytes());
         }
 
+        // For tools that lack hook support (anything except Claude), spawn a
+        // background task that polls the terminal grid every 1500 ms and runs
+        // the heuristic state-inference logic.
+        if !matches!(spec.tool, Tool::Claude) {
+            let poll_reg = self.reg.clone();
+            let poll_session = session.clone();
+            let poll_id = id.clone();
+            let poll_tool = spec.tool;
+            tokio::spawn(async move {
+                let poll_interval = tokio::time::Duration::from_millis(1500);
+                let mut last_line = String::new();
+                let mut last_change = std::time::Instant::now();
+
+                loop {
+                    tokio::time::sleep(poll_interval).await;
+
+                    // Stop polling if the session is gone from the registry.
+                    if poll_reg.get(&poll_id).is_none() {
+                        break;
+                    }
+
+                    let current_line = poll_session.last_nonempty_line();
+                    if current_line != last_line {
+                        last_line = current_line.clone();
+                        last_change = std::time::Instant::now();
+                    }
+                    let idle = last_change.elapsed();
+
+                    if let Some(new_state) = tools::infer_state(poll_tool, &current_line, idle) {
+                        let activity = match &new_state {
+                            State::Stuck => "no progress detected".to_string(),
+                            State::NeedsInput(DecisionKind::Question { prompt }) => {
+                                format!("waiting: {}", prompt)
+                            }
+                            _ => String::new(),
+                        };
+                        poll_reg.set_state(&poll_id, new_state, activity);
+                    }
+                }
+            });
+        }
+
         Ok(id)
     }
 
@@ -124,6 +167,32 @@ impl Daemon {
     pub fn resize(&self, id: &SessionId, cols: u16, rows: u16) {
         if let Some(p) = self.pty(id) {
             let _ = p.resize(cols, rows);
+        }
+    }
+
+    pub fn pause(&self, target: &Target) {
+        for id in self.reg.resolve_targets(target) {
+            if let Some(p) = self.pty(&id) {
+                p.pause();
+            }
+            self.reg.set_state(&id, State::Working, "paused");
+        }
+    }
+
+    pub fn resume(&self, target: &Target) {
+        for id in self.reg.resolve_targets(target) {
+            if let Some(p) = self.pty(&id) {
+                p.resume();
+            }
+            self.reg.set_state(&id, State::Working, "resumed");
+        }
+    }
+
+    /// Build and emit an [`Event::Grid`] for the given session from its current PTY grid.
+    pub fn request_grid(&self, id: &SessionId) {
+        if let Some(p) = self.pty(id) {
+            let (cols, rows, cursor_col, cursor_row, cells) = p.grid_snapshot();
+            self.reg.emit_grid(id.clone(), cols, rows, cursor_col, cursor_row, cells);
         }
     }
 

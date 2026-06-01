@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use protocol::{
-    Autonomy, DecisionKind, Event, HookDecision, Session, SessionId, State, Target, Tool,
+    Autonomy, CellSnap, DecisionKind, Event, HookDecision, Session, SessionId, State, Target, Tool,
 };
 use tokio::sync::{broadcast, oneshot};
 
@@ -171,6 +171,42 @@ impl Registry {
 
     pub fn emit_error(&self, message: String) {
         self.emit(Event::Error { message });
+    }
+
+    /// Broadcast a full styled-cell grid snapshot for `id` to all subscribers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_grid(
+        &self,
+        id: SessionId,
+        cols: u16,
+        rows: u16,
+        cursor_col: u16,
+        cursor_row: u16,
+        cells: Vec<CellSnap>,
+    ) {
+        self.emit(Event::Grid {
+            session: id,
+            cols,
+            rows,
+            cursor_col,
+            cursor_row,
+            cells,
+        });
+    }
+
+    /// Update the cumulative cost of a session and emit a [`SessionUpdate`].
+    /// No-op if `id` is unknown.
+    pub fn set_cost(&self, id: &SessionId, cost_usd: f64) {
+        let updated = {
+            let mut g = self.inner.lock().unwrap();
+            g.sessions.get_mut(id).map(|s| {
+                s.cost_usd = cost_usd;
+                s.clone()
+            })
+        };
+        if let Some(s) = updated {
+            self.emit(Event::SessionUpdate(s));
+        }
     }
 
     pub fn emit_decision_pending(&self, id: SessionId, kind: DecisionKind) {

@@ -25,3 +25,5 @@ rmp-serde.workspace = true
 # PTY + VT engine (versions confirmed by grounding research)
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
+# SIGSTOP / SIGCONT for pause/resume
+nix = { version = "0.29", features = ["signal"] }

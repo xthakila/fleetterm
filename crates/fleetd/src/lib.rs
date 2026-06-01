@@ -8,3 +8,4 @@ pub mod hooks;
 pub mod pty;
 pub mod registry;
 pub mod server;
+pub mod tools;

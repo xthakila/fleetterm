@@ -161,6 +161,22 @@ pub enum Request {
     Close(SessionId),
 }
 
+/// A snapshot of one terminal cell, colour-encoded as 0x00RRGGBB.
+///
+/// `fg` / `bg` are packed 24-bit RGB.  The special sentinel `0xFF000000` means
+/// "use the terminal default" and is used for the default foreground/background
+/// `NamedColor` variants so the UI can apply its own theme colour.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellSnap {
+    pub ch: char,
+    /// Foreground colour, packed 0x00RRGGBB. `0xFF000000` = terminal default fg.
+    pub fg: u32,
+    /// Background colour, packed 0x00RRGGBB. `0xFF000000` = terminal default bg.
+    pub bg: u32,
+    pub bold: bool,
+    pub inverse: bool,
+}
+
 /// daemon → UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
@@ -175,6 +191,15 @@ pub enum Event {
     SessionRemoved(SessionId),
     /// Incremental PTY output for a *visible* session.
     Output { session: SessionId, data: Vec<u8> },
+    /// Full styled-cell grid snapshot for a session (row-major, cols × rows cells).
+    Grid {
+        session: SessionId,
+        cols: u16,
+        rows: u16,
+        cursor_col: u16,
+        cursor_row: u16,
+        cells: Vec<CellSnap>,
+    },
     /// A new decision needs the human — drives the decisions inbox + toast.
     DecisionPending { session: SessionId, kind: DecisionKind },
     /// An autonomy auto-decision was made (for the audit log / activity feed).

@@ -119,18 +119,15 @@ fn handle_request(daemon: &Arc<Daemon>, req: Request) {
         }
         Request::SetAutonomy { session, level } => daemon.reg.set_autonomy(&session, level),
         Request::SetDefaultAutonomy(level) => daemon.reg.set_default_autonomy(level),
-        // Pause/Resume land in Phase 3 (SIGSTOP/SIGCONT on the child group).
-        Request::Pause(_) | Request::Resume(_) => {
-            tracing::debug!("pause/resume not yet implemented");
-        }
+        Request::Pause(target) => daemon.pause(&target),
+        Request::Resume(target) => daemon.resume(&target),
         Request::Stop(target) => daemon.stop(&target),
         Request::Resize {
             session,
             cols,
             rows,
         } => daemon.resize(&session, cols, rows),
-        // Grid snapshot streaming lands in Phase 1 rendering.
-        Request::RequestGrid(_) => {}
+        Request::RequestGrid(id) => daemon.request_grid(&id),
         Request::Close(id) => daemon.close(&id),
         Request::Subscribe => {}
     }

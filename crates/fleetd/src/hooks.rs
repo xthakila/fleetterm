@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use protocol::{safety, DecisionKind, HookDecision, HookEnvelope, HookKind, HookReply, State, Tool};
+use protocol::{safety, DecisionKind, HookDecision, HookEnvelope, HookKind, HookReply, SessionId, State, Tool};
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -65,6 +65,7 @@ pub async fn handle_hook(reg: &Arc<Registry>, env: HookEnvelope) -> HookReply {
         }
 
         HookKind::Notification => {
+            maybe_update_cost(reg, &env.session, &v);
             let msg = v
                 .get("message")
                 .and_then(Value::as_str)
@@ -79,11 +80,13 @@ pub async fn handle_hook(reg: &Arc<Registry>, env: HookEnvelope) -> HookReply {
         }
 
         HookKind::PostToolUse => {
+            maybe_update_cost(reg, &env.session, &v);
             reg.set_state(&env.session, State::Working, "working");
             HookReply { decision: None }
         }
 
         HookKind::Stop => {
+            maybe_update_cost(reg, &env.session, &v);
             reg.set_state(&env.session, State::Done, "finished — awaiting next prompt");
             HookReply { decision: None }
         }
@@ -97,6 +100,29 @@ pub async fn handle_hook(reg: &Arc<Registry>, env: HookEnvelope) -> HookReply {
             reg.set_state(&env.session, State::Working, "thinking…");
             HookReply { decision: None }
         }
+    }
+}
+
+/// Attempt to extract a cost figure from a hook payload and update the session.
+///
+/// Checked locations (first match wins):
+/// 1. `total_cost_usd` — top-level numeric field (Claude Code Stop / PostToolUse)
+/// 2. `cost` — top-level numeric field
+/// 3. `usage.total_cost_usd` — nested under `usage`
+///
+/// Silently does nothing if none of the paths resolves to a number.
+fn maybe_update_cost(reg: &Arc<Registry>, id: &SessionId, v: &Value) {
+    let cost = v
+        .get("total_cost_usd")
+        .and_then(Value::as_f64)
+        .or_else(|| v.get("cost").and_then(Value::as_f64))
+        .or_else(|| {
+            v.get("usage")
+                .and_then(|u| u.get("total_cost_usd"))
+                .and_then(Value::as_f64)
+        });
+    if let Some(usd) = cost {
+        reg.set_cost(id, usd);
     }
 }
 
@@ -245,5 +271,62 @@ mod tests {
             let _ = tx.send(HookDecision::Deny { reason: "cleanup".into() });
         }
         let _ = fut.await;
+    }
+
+    #[tokio::test]
+    async fn stop_hook_updates_cost_from_total_cost_usd() {
+        let (reg, id) = reg_with(Autonomy::Guarded);
+        handle_hook(
+            &reg,
+            HookEnvelope {
+                session: id.clone(),
+                kind: HookKind::Stop,
+                payload_json: serde_json::json!({ "total_cost_usd": 0.042 }).to_string(),
+            },
+        )
+        .await;
+        let sess = reg.get(&id).expect("session gone");
+        assert!(
+            (sess.cost_usd - 0.042).abs() < 1e-9,
+            "cost not updated: {}",
+            sess.cost_usd
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_hook_updates_cost_from_nested_usage() {
+        let (reg, id) = reg_with(Autonomy::Guarded);
+        handle_hook(
+            &reg,
+            HookEnvelope {
+                session: id.clone(),
+                kind: HookKind::Stop,
+                payload_json: serde_json::json!({ "usage": { "total_cost_usd": 1.23 } })
+                    .to_string(),
+            },
+        )
+        .await;
+        let sess = reg.get(&id).expect("session gone");
+        assert!(
+            (sess.cost_usd - 1.23).abs() < 1e-9,
+            "cost not updated: {}",
+            sess.cost_usd
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_hook_with_no_cost_field_is_silent() {
+        let (reg, id) = reg_with(Autonomy::Guarded);
+        handle_hook(
+            &reg,
+            HookEnvelope {
+                session: id.clone(),
+                kind: HookKind::Stop,
+                payload_json: serde_json::json!({ "message": "done" }).to_string(),
+            },
+        )
+        .await;
+        let sess = reg.get(&id).expect("session gone");
+        assert_eq!(sess.cost_usd, 0.0, "cost should remain 0 when absent");
     }
 }
