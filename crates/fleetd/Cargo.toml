@@ -1,0 +1,27 @@
+[package]
+name = "fleetd"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fleetd"
+path = "src/main.rs"
+
+[lib]
+name = "fleetd"
+path = "src/lib.rs"
+
+[dependencies]
+protocol.workspace = true
+serde.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde_json.workspace = true
+rmp-serde.workspace = true
+# PTY + VT engine (versions confirmed by grounding research)
+portable-pty = "0.9"
+alacritty_terminal = "0.26"

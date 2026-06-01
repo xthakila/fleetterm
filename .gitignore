@@ -1,0 +1,7 @@
+/target
+**/*.rs.bk
+*.pdb
+.DS_Store
+# generated per-session Claude settings + runtime sockets
+/run
+*.sock
