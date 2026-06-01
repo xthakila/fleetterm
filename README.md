@@ -78,8 +78,9 @@ target/debug/fleetterm                # the cockpit window
 - **P2** Claude rich lane: hooks → state → fleet sidebar (read + approve/deny) — ✅.
 - **P3** Autonomy engine + pause/resume + per-session controls — ✅ (`@all` composer pending). *(the leap)*
 - **P4** Multi-tool heuristic adapters (codex/aider/gemini) — ✅ (spawn presets/worktrees pending).
-- **P5** Tiled/Focus views · `⌘K` palette · governance · polish — ⏳ next.
-- **next** real styled cell-grid terminal + keyboard→PTY input (see `docs/terminal-element-design.md`).
+- **P5** Split/Tiled/Focus views · `⌘K` palette — ✅.
+- **terminal** styled cell-grid renderer + keyboard→PTY input + live focused grid — ✅.
+- **next** OSC-133 blocks rendered in the UI (daemon emits them) · `@all` composer · worktree spawn · detach/reattach polish · live Claude-hook demo.
 - **P6** *(deferred)* inter-agent orchestration · remote/federation.
 
 UI look & feel: see the mockups in `~/fleetterm-v2.html` (canonical) and the gallery
