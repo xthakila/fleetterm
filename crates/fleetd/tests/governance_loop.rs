@@ -2,6 +2,10 @@
 //! a UI subscribes, a (simulated) hook fires PreToolUse, the daemon either auto-allows
 //! (safe) or escalates → emits DecisionPending → the UI decides → the parked hook is
 //! unblocked with the matching decision. This is the core of Phases 2–3.
+//!
+//! Also contains the live-grid push test: after `RequestGrid` marks a session as
+//! watched, `Event::Grid` events must arrive on the broadcast channel without further
+//! explicit requests.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -10,7 +14,7 @@ use fleetd::daemon::Daemon;
 use fleetd::{framed, server};
 use protocol::{
     Autonomy, Event, Frame, HookDecision, HookEnvelope, HookKind, HookReply, Request, Session,
-    SessionId, State, Tool,
+    SessionId, SpawnSpec, State, Target, Tool,
 };
 use tokio::net::UnixStream;
 use tokio::time::timeout;
@@ -224,6 +228,126 @@ async fn denial_carries_the_instruction_back_to_the_agent() {
         }
         other => panic!("expected Deny with instruction, got {other:?}"),
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Live-grid push test
+// ---------------------------------------------------------------------------
+
+/// After `RequestGrid` marks a session as *watched*, the daemon must autonomously
+/// push `Event::Grid` events at ~80 ms cadence as the session produces output —
+/// without the UI sending additional `RequestGrid` requests.
+///
+/// We spawn a real shell that continuously prints text, subscribe a UI, send one
+/// `RequestGrid`, then wait to receive at least one more `Event::Grid` that arrived
+/// without any further request from us.
+#[tokio::test]
+async fn watched_session_pushes_live_grid_updates() {
+    let (daemon, sock, dir) = temp_daemon("livegrid");
+    let d = daemon.clone();
+    tokio::spawn(async move {
+        let _ = server::serve(d).await;
+    });
+    await_socket(&sock).await;
+
+    // Connect as a UI and subscribe to the event stream.
+    let mut ui = UnixStream::connect(&sock).await.unwrap();
+    framed::write_frame(&mut ui, &Frame::Request(Request::Subscribe))
+        .await
+        .unwrap();
+    // Consume the initial snapshot.
+    let snap: Event = framed::read_frame(&mut ui).await.unwrap();
+    assert!(matches!(snap, Event::Snapshot { .. }), "expected Snapshot");
+
+    // Spawn a shell session that emits output continuously.
+    framed::write_frame(
+        &mut ui,
+        &Frame::Request(Request::Spawn(SpawnSpec {
+            name: Some("live-grid-test".into()),
+            tool: Tool::Shell,
+            model: None,
+            cwd: None,
+            worktree_from: None,
+            autonomy: Autonomy::Auto,
+            // Print a line every 50 ms — fast enough to produce output within our window.
+            opening: Some("while true; do printf 'tick\\n'; sleep 0.05; done".into()),
+            env: vec![],
+        })),
+    )
+    .await
+    .unwrap();
+
+    // Drain events until we learn the spawned session's id from SessionUpdate.
+    let session_id = {
+        let mut found = None;
+        for _ in 0..40 {
+            let ev: Event = timeout(Duration::from_secs(2), framed::read_frame(&mut ui))
+                .await
+                .expect("timeout waiting for SessionUpdate")
+                .expect("frame error");
+            if let Event::SessionUpdate(s) = ev {
+                found = Some(s.id);
+                break;
+            }
+        }
+        found.expect("never received SessionUpdate for spawned session")
+    };
+
+    // Give the shell a moment to start printing.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Send ONE RequestGrid — this marks the session as watched.
+    framed::write_frame(
+        &mut ui,
+        &Frame::Request(Request::RequestGrid(session_id.clone())),
+    )
+    .await
+    .unwrap();
+
+    // Drain until we see the first Grid event (triggered by our RequestGrid).
+    let mut got_first_grid = false;
+    for _ in 0..60 {
+        let ev: Event = timeout(Duration::from_secs(3), framed::read_frame(&mut ui))
+            .await
+            .expect("timeout waiting for first Grid")
+            .expect("frame error");
+        if matches!(&ev, Event::Grid { session, .. } if *session == session_id) {
+            got_first_grid = true;
+            break;
+        }
+    }
+    assert!(got_first_grid, "never received the first Event::Grid from RequestGrid");
+
+    // Now wait for a SECOND Event::Grid without sending another RequestGrid.
+    // The live-grid watcher task must emit it within ~400 ms (a few 80 ms ticks).
+    let mut got_live_grid = false;
+    for _ in 0..80 {
+        match timeout(Duration::from_millis(400), framed::read_frame::<_, Event>(&mut ui)).await {
+            Ok(Ok(ev)) => {
+                if matches!(&ev, Event::Grid { session, .. } if *session == session_id) {
+                    got_live_grid = true;
+                    break;
+                }
+                // Other events (Output, SessionUpdate) are fine — keep draining.
+            }
+            Ok(Err(_)) => break,
+            Err(_) => break, // timeout — no more events in time
+        }
+    }
+    assert!(
+        got_live_grid,
+        "live-grid watcher never pushed a second Event::Grid autonomously"
+    );
+
+    // Cleanup: stop the session.
+    framed::write_frame(
+        &mut ui,
+        &Frame::Request(Request::Stop(Target::Session(session_id))),
+    )
+    .await
+    .unwrap();
 
     let _ = std::fs::remove_dir_all(&dir);
 }

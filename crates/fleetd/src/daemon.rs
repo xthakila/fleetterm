@@ -23,6 +23,9 @@ pub struct Daemon {
     run_dir: PathBuf,
     /// path to the `fleetterm-hook` binary
     hook_bin: PathBuf,
+    /// The session a UI is currently viewing (for live grid push).
+    /// Updated by [`Daemon::request_grid`]; cleared when the session is closed.
+    watched: Mutex<Option<SessionId>>,
 }
 
 const DEFAULT_COLS: u16 = 80;
@@ -36,6 +39,7 @@ impl Daemon {
             sock_path,
             run_dir,
             hook_bin,
+            watched: Mutex::new(None),
         })
     }
 
@@ -104,6 +108,54 @@ impl Daemon {
             let mut line = opening.clone();
             line.push('\r');
             let _ = session.write_input(line.as_bytes());
+        }
+
+        // Live-grid watcher: while this session is the one the UI is watching,
+        // push a fresh Event::Grid every ~80 ms so the focused terminal updates
+        // in real-time without the UI needing to poll via RequestGrid.
+        //
+        // Safety note: grid_snapshot() acquires the Term lock. The reader thread
+        // in PtySession::spawn releases the Term lock *before* calling on_output
+        // (see pty.rs: the `{ let mut t = term.lock()... }` block closes before
+        // `on_output(chunk.to_vec())` on the next line), so there is no deadlock
+        // between the reader thread and this task calling grid_snapshot().
+        {
+            // `spawn()` takes `self: &Arc<Self>`, so cloning `self` gives an Arc clone.
+            let watch_daemon = self.clone();
+            let watch_session = session.clone();
+            let watch_id = id.clone();
+            let watch_reg = self.reg.clone();
+            tokio::spawn(async move {
+                let interval = tokio::time::Duration::from_millis(80);
+                loop {
+                    tokio::time::sleep(interval).await;
+
+                    // Stop if the session has been removed from the registry.
+                    if watch_reg.get(&watch_id).is_none() {
+                        break;
+                    }
+
+                    // Only emit a grid if this session is the one being watched.
+                    let is_watched = {
+                        let w = watch_daemon.watched.lock().unwrap();
+                        w.as_ref() == Some(&watch_id)
+                    };
+                    if !is_watched {
+                        continue;
+                    }
+
+                    let (cols, rows, cursor_col, cursor_row, cells) =
+                        watch_session.grid_snapshot();
+                    watch_reg.emit_grid(
+                        watch_id.clone(),
+                        cols,
+                        rows,
+                        cursor_col,
+                        cursor_row,
+                        cells,
+                    );
+                }
+            });
         }
 
         // For tools that lack hook support (anything except Claude), spawn a
@@ -212,7 +264,14 @@ impl Daemon {
     }
 
     /// Build and emit an [`Event::Grid`] for the given session from its current PTY grid.
+    ///
+    /// Also marks this session as the **watched** session, activating the live-grid
+    /// push task (see [`Daemon::spawn`]) so subsequent output changes are pushed to
+    /// subscribers at ~80 ms cadence without further `RequestGrid` calls.
     pub fn request_grid(&self, id: &SessionId) {
+        // Mark this session as the one the UI is currently viewing.
+        *self.watched.lock().unwrap() = Some(id.clone());
+
         if let Some(p) = self.pty(id) {
             let (cols, rows, cursor_col, cursor_row, cells) = p.grid_snapshot();
             self.reg.emit_grid(id.clone(), cols, rows, cursor_col, cursor_row, cells);
@@ -231,6 +290,15 @@ impl Daemon {
     pub fn close(&self, id: &SessionId) {
         if let Some(p) = self.ptys.lock().unwrap().remove(id) {
             p.kill();
+        }
+        // If this session was being watched, clear the watch so the live-grid task
+        // stops emitting (it also stops on reg.get() returning None, but clearing here
+        // is immediate and avoids one spurious emit after removal).
+        {
+            let mut w = self.watched.lock().unwrap();
+            if w.as_ref() == Some(id) {
+                *w = None;
+            }
         }
         self.reg.remove(id);
     }

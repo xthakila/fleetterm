@@ -1,8 +1,12 @@
-//! FleetTerm UI — Phase 2 / 3 fleet cockpit.
+//! FleetTerm UI — Phase 2 / 3 / 5 fleet cockpit.
 //!
 //! Connects to `fleetd` over a unix socket (via `client::FleetClient`), renders all agent
 //! sessions in a sidebar, lets the user approve/deny decisions and cycle autonomy, and
 //! shows the focused session's terminal output in the main pane.
+//!
+//! P5 additions:
+//! - View modes: Split (default) | Tiled | Focus — toggled via title-bar chips.
+//! - Cmd-K / Ctrl-K command palette.
 //!
 //! API verified against gpui 0.2.2 (new App/Window/Context surface).
 
@@ -13,11 +17,14 @@ use std::collections::{BTreeMap, HashMap};
 
 use async_channel::Sender;
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseDownEvent, SharedString, TitlebarOptions, WeakEntity, Window,
-    WindowBounds, WindowOptions,
+    KeyBinding, actions, div, prelude::*, px, relative, rgb, size, App, Application, Bounds,
+    Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, SharedString,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use protocol::{Autonomy, Event, Request, Session, SessionId, SpawnSpec, State, Target, Tool};
+
+// ── P5 actions ───────────────────────────────────────────────────────────────
+actions!(fleetterm, [TogglePalette]);
 
 // ── v2 colour palette (matches the Phase-0 spike) ────────────────────────────
 #[allow(dead_code)]
@@ -36,11 +43,29 @@ mod color {
     pub const VIO: u32 = 0xbb9af7;
     pub const AMBER: u32 = 0xf5a623;
     pub const RED: u32 = 0xf7768e;
+    /// Palette overlay background (slightly lighter than HEAD).
+    pub const PALETTE_BG: u32 = 0x1e2030;
 }
 
 // ── terminal output cap ───────────────────────────────────────────────────────
 const TERM_MAX_BYTES: usize = 40 * 1024; // 40 KB
 const TERM_MAX_LINES: usize = 400;
+
+/// Maximum session tiles shown in Tiled mode before truncation notice.
+const TILED_MAX: usize = 6;
+
+// ── P5 view mode ─────────────────────────────────────────────────────────────
+
+/// Which layout the main body uses.
+#[derive(Clone, Copy, PartialEq)]
+enum ViewMode {
+    /// Split: focused terminal pane on the left + session sidebar on the right (default).
+    Split,
+    /// Tiled: grid of session tiles, each showing a mini terminal.
+    Tiled,
+    /// Focus: terminal pane only — sidebar hidden.
+    Focus,
+}
 
 // ── application state ────────────────────────────────────────────────────────
 
@@ -61,6 +86,14 @@ struct FleetTermApp {
     requests: Sender<Request>,
     /// GPUI focus handle — the terminal pane tracks this to receive keystrokes.
     focus_handle: FocusHandle,
+
+    // ── P5 fields ─────────────────────────────────────────────────────────────
+    /// Current view layout mode.
+    view_mode: ViewMode,
+    /// Whether the Cmd-K command palette overlay is open.
+    palette_open: bool,
+    /// Search query typed in the palette (v1: display only, not yet wired to fuzzy filter).
+    palette_query: String,
 }
 
 impl FleetTermApp {
@@ -90,6 +123,9 @@ impl FleetTermApp {
             total_cost: 0.0,
             requests,
             focus_handle: cx.focus_handle(),
+            view_mode: ViewMode::Split,
+            palette_open: false,
+            palette_query: String::new(),
         }
     }
 
@@ -277,6 +313,29 @@ fn state_glyph_color(state: &State) -> u32 {
     dot_color(state)
 }
 
+/// A small pill button used in the title bar for view mode toggles.
+/// `active` controls whether it gets the highlighted background.
+fn view_mode_chip(label: &'static str, active: bool) -> gpui::Div {
+    div()
+        .text_xs()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .bg(if active {
+            rgb(color::BORDER)
+        } else {
+            rgb(color::HEAD)
+        })
+        .border_1()
+        .border_color(rgb(color::BORDER))
+        .text_color(if active {
+            rgb(color::TEXT)
+        } else {
+            rgb(color::MUT)
+        })
+        .child(SharedString::from(label))
+}
+
 // ── Render ────────────────────────────────────────────────────────────────────
 
 impl Render for FleetTermApp {
@@ -326,7 +385,39 @@ impl Render for FleetTermApp {
             .and_then(|id| self.grids.get(id))
             .cloned();
 
+        // Snapshot of view mode and palette state for the closure captures below.
+        let view_mode = self.view_mode;
+        let palette_open = self.palette_open;
+        let palette_query = self.palette_query.clone();
+
         // ── Title bar ─────────────────────────────────────────────────────────
+        // View mode toggle chips
+        let chip_split_active = view_mode == ViewMode::Split;
+        let chip_tiled_active = view_mode == ViewMode::Tiled;
+        let chip_focus_active = view_mode == ViewMode::Focus;
+
+        let chip_split = view_mode_chip("Split", chip_split_active).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                this.view_mode = ViewMode::Split;
+                cx.notify();
+            }),
+        );
+        let chip_tiled = view_mode_chip("Tiled", chip_tiled_active).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                this.view_mode = ViewMode::Tiled;
+                cx.notify();
+            }),
+        );
+        let chip_focus = view_mode_chip("Focus", chip_focus_active).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                this.view_mode = ViewMode::Focus;
+                cx.notify();
+            }),
+        );
+
         let title_bar = div()
             .flex()
             .flex_row()
@@ -347,6 +438,8 @@ impl Render for FleetTermApp {
                     .text_color(rgb(0xe6e6f0))
                     .child(SharedString::from("FleetTerm")),
             )
+            // ── P5: view mode chips ────────────────────────────────────────────
+            .child(div().flex_row().gap_1().flex().child(chip_split).child(chip_tiled).child(chip_focus))
             .child(div().flex_1())
             // Live counts
             .child(
@@ -802,24 +895,455 @@ impl Render for FleetTermApp {
             )
             .child(div().text_color(rgb(color::MUT)).child(SharedString::from("⌘K palette")));
 
-        // ── Root ───────────────────────────────────────────────────────────────
-        div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .bg(rgb(color::BG))
-            .text_color(rgb(color::TEXT))
-            .child(title_bar)
-            .child(
+        // ── P5: Body — layout varies by view mode ─────────────────────────────
+        let body = match view_mode {
+            ViewMode::Split => {
+                // Original layout: terminal pane + sidebar.
                 div()
                     .flex()
                     .flex_row()
                     .flex_1()
                     .min_h(px(0.0))
                     .child(terminal_pane)
-                    .child(sidebar),
-            )
+                    .child(sidebar)
+                    .into_any_element()
+            }
+            ViewMode::Focus => {
+                // Terminal pane only — sidebar hidden.
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(terminal_pane)
+                    .into_any_element()
+            }
+            ViewMode::Tiled => {
+                // Grid of tiles, one per session with a grid snapshot (or text fallback).
+                // We show at most TILED_MAX tiles; if more sessions exist we note it.
+                let all_sessions: Vec<Session> = sorted_sessions.clone();
+                let truncated = all_sessions.len() > TILED_MAX;
+                let tile_sessions = all_sessions.into_iter().take(TILED_MAX);
+
+                let tiles = tile_sessions.enumerate().map(|(tile_idx, s)| {
+                    let sid = s.id.clone();
+                    let sid_click = s.id.clone();
+                    let dot_c = dot_color(&s.state);
+                    let glyph = state_glyph(&s.state);
+                    let tile_name = format!("{} {}", s.name, glyph);
+                    let tx_tile = requests_tx.clone();
+
+                    // Pick a stable element id for the tile.
+                    let tile_id = SharedString::from(format!("tile-{}", tile_idx));
+
+                    // If we have a grid for this session, render it as a GridElement.
+                    // Otherwise show the last few lines of term_text.
+                    let tile_content: gpui::AnyElement = {
+                        if let Some(grid) = self.grids.get(&sid).cloned() {
+                            let fh = focus_handle.clone();
+                            terminal::GridElement {
+                                grid,
+                                focus_handle: fh,
+                            }
+                            .into_any_element()
+                        } else {
+                            // Show last 6 lines of text output, or a placeholder.
+                            let lines: Vec<SharedString> = self
+                                .term_text
+                                .get(&sid)
+                                .map(|t| {
+                                    t.lines()
+                                        .rev()
+                                        .take(6)
+                                        .collect::<Vec<_>>()
+                                        .into_iter()
+                                        .rev()
+                                        .map(|l| SharedString::from(l.to_owned()))
+                                        .collect()
+                                })
+                                .unwrap_or_else(|| vec![SharedString::from("(no output yet)")]);
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .gap_1()
+                                .p_1()
+                                .children(lines.into_iter().map(|l| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(color::DIM))
+                                        .child(l)
+                                }))
+                                .into_any_element()
+                        }
+                    };
+
+                    div()
+                        .id(tile_id)
+                        // Each tile takes ~50% of the row width; two columns via flex-wrap.
+                        .w(relative(0.5))
+                        .h(px(200.0))
+                        .flex()
+                        .flex_col()
+                        .border_1()
+                        .border_color(rgb(color::BORDER))
+                        .bg(rgb(color::TERM))
+                        .overflow_hidden()
+                        // Tile header: status dot + name.
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .bg(rgb(color::HEAD))
+                                .border_b_1()
+                                .border_color(rgb(color::BORDER))
+                                .child(status_dot(dot_c))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(color::TEXT))
+                                        .child(SharedString::from(tile_name)),
+                                ),
+                        )
+                        // Tile body: grid or text.
+                        .child(div().flex().flex_col().flex_1().overflow_hidden().child(tile_content))
+                        // Clicking focuses this session and fetches a fresh grid.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            move |_ev: &MouseDownEvent, _window, _cx| {
+                                let _ = tx_tile.try_send(Request::RequestGrid(sid_click.clone()));
+                            },
+                        )
+                });
+
+                let mut tiled_div = div()
+                    .id("tiled-body")
+                    .flex()
+                    .flex_wrap()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .bg(rgb(color::BG))
+                    .overflow_y_scroll()
+                    .children(tiles);
+
+                // Truncation notice when session count exceeds TILED_MAX.
+                if truncated {
+                    tiled_div = tiled_div.child(
+                        div()
+                            .w_full()
+                            .px_3()
+                            .py_2()
+                            .text_xs()
+                            .text_color(rgb(color::MUT))
+                            .child(SharedString::from(format!(
+                                "… {} more sessions — switch to Split view to see all",
+                                n_sessions.saturating_sub(TILED_MAX)
+                            ))),
+                    );
+                }
+
+                tiled_div.into_any_element()
+            }
+        };
+
+        // ── P5: Command palette overlay ────────────────────────────────────────
+        // The palette is layered as an absolute child of the root so it sits above
+        // everything else.  Pattern from gpui's own FallbackPromptRenderer (prompts.rs):
+        // parent is relative, palette is absolute + top_0 + left_0 + size_full.
+        //
+        // Palette v1: lists sessions (jump), "+ new shell", "+ new claude",
+        // "approve next ⚑".  Fuzzy filtering against palette_query is noted but
+        // deferred — the query field is captured for display.
+
+        // Build the session jump rows.
+        let palette_sessions: Vec<Session> = sorted_sessions.clone();
+        let palette_open_inner = palette_open;
+
+        // Collect info for the "approve next NeedsInput" action.
+        let first_needs: Option<SessionId> = palette_sessions
+            .iter()
+            .find(|s| s.state.needs_human())
+            .map(|s| s.id.clone());
+
+        let tx_palette_shell = requests_tx.clone();
+        let tx_palette_claude = requests_tx.clone();
+        let tx_palette_approve = requests_tx.clone();
+        let first_needs_for_approve = first_needs.clone();
+
+        // Build palette rows for each session.
+        let palette_session_rows: Vec<_> = palette_sessions
+            .iter()
+            .map(|s| {
+                let label = format!(
+                    "jump to {}  {}",
+                    s.name,
+                    state_glyph(&s.state)
+                );
+                let sid_jump = s.id.clone();
+                let tx_jump = requests_tx.clone();
+
+                div()
+                    .id(SharedString::from(format!("pal-sess-{}", s.id)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(color::BORDER))
+                    .text_xs()
+                    .text_color(rgb(color::TEXT))
+                    .child(status_dot(dot_color(&s.state)))
+                    .child(SharedString::from(label))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            this.focused = Some(sid_jump.clone());
+                            let _ = tx_jump.try_send(Request::RequestGrid(sid_jump.clone()));
+                            this.palette_open = false;
+                            cx.notify();
+                        }),
+                    )
+            })
+            .collect();
+
+        // "approve next ⚑" row — only shown when there is a NeedsInput session.
+        let approve_row = first_needs.map(|_| {
+            div()
+                .id("pal-approve-next")
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(rgb(color::BORDER))
+                .text_xs()
+                .text_color(rgb(color::AMBER))
+                .child(SharedString::from("approve next ⚑"))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                        if let Some(ref sid) = first_needs_for_approve {
+                            let _ = tx_palette_approve.try_send(Request::Decide {
+                                session: sid.clone(),
+                                approve: true,
+                                instruction: None,
+                            });
+                        }
+                        this.palette_open = false;
+                        cx.notify();
+                    }),
+                )
+        });
+
+        // ── Root ───────────────────────────────────────────────────────────────
+        // The root div must be `id`'d and `track_focus`'d so that on_action fires
+        // for keybindings registered on the App (cmd-k → TogglePalette).
+        div()
+            .id("fleet-root")
+            .flex()
+            .flex_col()
+            .size_full()
+            .bg(rgb(color::BG))
+            .text_color(rgb(color::TEXT))
+            .track_focus(&self.focus_handle)
+            .key_context("FleetTerm")
+            // P5: Toggle palette action handler.
+            .on_action(cx.listener(|this, _: &TogglePalette, _window, cx| {
+                this.palette_open = !this.palette_open;
+                cx.notify();
+            }))
+            // Close palette on Escape (handled as raw key_down; action-based close is also
+            // possible but requires registering an Escape binding which might conflict).
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                if this.palette_open && ev.keystroke.key.as_str() == "escape" {
+                    this.palette_open = false;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
+            .child(title_bar)
+            .child(body)
             .child(status_line)
+            // ── Palette overlay (conditionally rendered) ───────────────────────
+            // Pattern: absolute child covering the full root.  The palette panel itself
+            // is centered via flex justify/items_center on the backdrop div.
+            .when(palette_open_inner, |root| {
+                root.child(
+                    // Semi-transparent backdrop — clicking it closes the palette.
+                    div()
+                        .id("palette-backdrop")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(rgb(0x000000))
+                        .opacity(0.6)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _ev: &MouseDownEvent, _window, cx| {
+                                this.palette_open = false;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    // The palette panel — centered absolute overlay.
+                    div()
+                        .id("palette-panel")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_start()
+                        // Push the panel down ~15% from the top so it reads as a modal.
+                        .pt(px(80.0))
+                        .child(
+                            div()
+                                .w(px(520.0))
+                                .h(px(480.0))
+                                .flex()
+                                .flex_col()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(color::BORDER))
+                                .bg(rgb(color::PALETTE_BG))
+                                .overflow_hidden()
+                                // Query prompt (v1: display only, not yet interactive).
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_3()
+                                        .py_2()
+                                        .bg(rgb(color::HEAD))
+                                        .border_b_1()
+                                        .border_color(rgb(color::BORDER))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(color::MUT))
+                                                .child(SharedString::from("⌘")),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .text_xs()
+                                                .text_color(rgb(color::TEXT))
+                                                .child(SharedString::from(
+                                                    if palette_query.is_empty() {
+                                                        "Search commands and sessions…"
+                                                    } else {
+                                                        // In v1, the query is display-only.
+                                                        // Full typing requires EntityInputHandler.
+                                                        "Search commands and sessions…"
+                                                    },
+                                                )),
+                                        ),
+                                )
+                                // Scrollable list of actions + sessions.
+                                .child(
+                                    div()
+                                        .id("palette-list")
+                                        .flex()
+                                        .flex_col()
+                                        .overflow_y_scroll()
+                                        // Static action: "+ new shell"
+                                        .child(
+                                            div()
+                                                .id("pal-new-shell")
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_2()
+                                                .px_3()
+                                                .py_2()
+                                                .border_b_1()
+                                                .border_color(rgb(color::BORDER))
+                                                .text_xs()
+                                                .text_color(rgb(color::BLUE))
+                                                .child(SharedString::from("+ new shell"))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                                        let _ = tx_palette_shell.try_send(Request::Spawn(SpawnSpec {
+                                                            name: None,
+                                                            tool: Tool::Shell,
+                                                            model: None,
+                                                            cwd: None,
+                                                            worktree_from: None,
+                                                            autonomy: default_autonomy,
+                                                            opening: None,
+                                                            env: vec![],
+                                                        }));
+                                                        this.palette_open = false;
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                        // Static action: "+ new claude"
+                                        .child(
+                                            div()
+                                                .id("pal-new-claude")
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap_2()
+                                                .px_3()
+                                                .py_2()
+                                                .border_b_1()
+                                                .border_color(rgb(color::BORDER))
+                                                .text_xs()
+                                                .text_color(rgb(color::BLUE))
+                                                .child(SharedString::from("+ new claude"))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                                                        let _ = tx_palette_claude.try_send(Request::Spawn(SpawnSpec {
+                                                            name: None,
+                                                            tool: Tool::Claude,
+                                                            model: None,
+                                                            cwd: None,
+                                                            worktree_from: None,
+                                                            autonomy: default_autonomy,
+                                                            opening: None,
+                                                            env: vec![],
+                                                        }));
+                                                        this.palette_open = false;
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                        // Conditional: "approve next ⚑"
+                                        .when_some(approve_row, |d, row| d.child(row))
+                                        // Session jump rows.
+                                        .when(!palette_session_rows.is_empty(), |d| {
+                                            d.child(
+                                                div()
+                                                    .px_3()
+                                                    .py_1()
+                                                    .text_xs()
+                                                    .text_color(rgb(color::MUT))
+                                                    .child(SharedString::from("SESSIONS")),
+                                            )
+                                            .children(palette_session_rows)
+                                        }),
+                                ),
+                        ),
+                )
+            })
     }
 }
 
@@ -827,6 +1351,12 @@ impl Render for FleetTermApp {
 
 fn main() {
     Application::new().run(|cx: &mut App| {
+        // P5: bind Cmd-K and Ctrl-K to TogglePalette globally.
+        cx.bind_keys([
+            KeyBinding::new("cmd-k", TogglePalette, None),
+            KeyBinding::new("ctrl-k", TogglePalette, None),
+        ]);
+
         let bounds = Bounds::centered(None, size(px(1100.0), px(700.0)), cx);
         cx.open_window(
             WindowOptions {
