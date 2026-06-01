@@ -7,16 +7,17 @@
 //! API verified against gpui 0.2.2 (new App/Window/Context surface).
 
 mod client;
+mod terminal;
 
 use std::collections::{BTreeMap, HashMap};
 
 use async_channel::Sender;
 use gpui::{
-    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, MouseButton,
-    MouseDownEvent, SharedString, TitlebarOptions, WeakEntity, Window, WindowBounds,
-    WindowOptions,
+    div, prelude::*, px, rgb, size, App, Application, Bounds, Context, FocusHandle, Focusable,
+    KeyDownEvent, MouseButton, MouseDownEvent, SharedString, TitlebarOptions, WeakEntity, Window,
+    WindowBounds, WindowOptions,
 };
-use protocol::{Autonomy, Event, Request, Session, SessionId, SpawnSpec, State, Tool};
+use protocol::{Autonomy, Event, Request, Session, SessionId, SpawnSpec, State, Target, Tool};
 
 // ── v2 colour palette (matches the Phase-0 spike) ────────────────────────────
 #[allow(dead_code)]
@@ -48,6 +49,8 @@ struct FleetTermApp {
     sessions: BTreeMap<SessionId, Session>,
     /// Terminal output buffer per session (raw UTF-8, lossy).
     term_text: HashMap<SessionId, String>,
+    /// Styled cell-grid snapshots from `Event::Grid`, one per session.
+    grids: HashMap<SessionId, terminal::GridState>,
     /// Which session's output is shown in the left pane.
     focused: Option<SessionId>,
     /// Fleet-wide default autonomy for new sessions.
@@ -56,6 +59,8 @@ struct FleetTermApp {
     total_cost: f64,
     /// Channel for sending requests to the daemon.
     requests: Sender<Request>,
+    /// GPUI focus handle — the terminal pane tracks this to receive keystrokes.
+    focus_handle: FocusHandle,
 }
 
 impl FleetTermApp {
@@ -79,10 +84,12 @@ impl FleetTermApp {
         FleetTermApp {
             sessions: BTreeMap::new(),
             term_text: HashMap::new(),
+            grids: HashMap::new(),
             focused: None,
             default_autonomy: Autonomy::Guarded,
             total_cost: 0.0,
             requests,
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -117,6 +124,7 @@ impl FleetTermApp {
                     self.focused = self.sessions.keys().next().cloned();
                 }
                 self.term_text.remove(&id);
+                self.grids.remove(&id);
             }
             Event::Output { session, data } => {
                 let text = String::from_utf8_lossy(&data).into_owned();
@@ -152,6 +160,24 @@ impl FleetTermApp {
                     self.focused = Some(session);
                 }
             }
+            // Grid: replace the stored cell-grid for this session.  Also auto-focus
+            // the session so clicking a sidebar card (which sends RequestGrid) will
+            // both fetch the grid *and* switch the terminal pane to that session.
+            Event::Grid {
+                session,
+                cols,
+                rows,
+                cursor_col,
+                cursor_row,
+                cells,
+            } => {
+                self.grids.insert(
+                    session.clone(),
+                    terminal::GridState::new(cols, rows, cursor_col, cursor_row, cells),
+                );
+                // Focus the session that just sent us a grid.
+                self.focused = Some(session);
+            }
             // DecisionPending: state already updated via SessionUpdate; sidebar shows buttons.
             Event::DecisionPending { .. } => {}
             // AutoDecision and Error: silently ignored (could append to a log in the future).
@@ -178,6 +204,33 @@ impl FleetTermApp {
         (needs, working, done)
     }
 
+    // ── keyboard handler ──────────────────────────────────────────────────────
+
+    /// Forward a keystroke to the focused session's PTY.
+    fn on_term_key_down(
+        &mut self,
+        ev: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ref session_id) = self.focused else {
+            return;
+        };
+        if let Some(data) = terminal::encode_key(&ev.keystroke) {
+            let tx = self.requests.clone();
+            let target = Target::Session(session_id.clone());
+            let _ = tx.try_send(Request::Input { target, data });
+            cx.stop_propagation();
+        }
+    }
+}
+
+// ── Focusable impl (lets GPUI route keyboard events to our terminal pane) ─────
+
+impl Focusable for FleetTermApp {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 // ── small rendering helpers ───────────────────────────────────────────────────
@@ -227,7 +280,7 @@ fn state_glyph_color(state: &State) -> u32 {
 // ── Render ────────────────────────────────────────────────────────────────────
 
 impl Render for FleetTermApp {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (needs, working, done) = self.counts();
         let n_sessions = self.sessions.len();
         let total_cost = self.total_cost;
@@ -264,6 +317,14 @@ impl Render for FleetTermApp {
 
         let focused_id = self.focused.clone();
         let requests_tx = self.requests.clone();
+        let focus_handle = self.focus_handle.clone();
+
+        // If there's a grid for the focused session, clone it for rendering.
+        let focused_grid: Option<terminal::GridState> = self
+            .focused
+            .as_ref()
+            .and_then(|id| self.grids.get(id))
+            .cloned();
 
         // ── Title bar ─────────────────────────────────────────────────────────
         let title_bar = div()
@@ -314,28 +375,58 @@ impl Render for FleetTermApp {
             );
 
         // ── Terminal pane ──────────────────────────────────────────────────────
-        // Each line of terminal output is a text child; the column scrolls vertically.
-        let terminal_pane = div()
-            .flex()
-            .flex_col()
-            .flex_1()
-            .p_3()
-            .bg(rgb(color::TERM))
-            .text_color(rgb(color::TEXT))
-            .overflow_hidden()
-            // Scrollable inner container — needs an id for StatefulInteractiveElement.
-            .child(
-                div()
-                    .id("term-scroll")
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .gap_1()
-                    .overflow_y_scroll()
-                    .children(term_content.into_iter().map(|line| {
-                        div().text_xs().text_color(rgb(color::TEXT)).child(line)
-                    })),
-            );
+        // When a `Event::Grid` has been received for the focused session, render it
+        // as a real cell-grid (Layer 1 bg quads + Layer 2 glyphs + Layer 3 cursor)
+        // inside a focusable div that forwards keystrokes to the PTY.
+        // Otherwise fall back to the raw text-line view.
+        let terminal_pane = if let Some(grid) = focused_grid {
+            // Build the grid element (paints only; key handling is on the wrapping div).
+            let grid_elem = terminal::GridElement {
+                grid,
+                focus_handle: focus_handle.clone(),
+            };
+            // Wrap in a focusable, key-handling div.
+            // Clicking the terminal grabs keyboard focus so key events start flowing.
+            let fh_click = focus_handle.clone();
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .bg(rgb(color::TERM))
+                .overflow_hidden()
+                .track_focus(&focus_handle)
+                .key_context("Terminal")
+                .on_key_down(cx.listener(FleetTermApp::on_term_key_down))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |_ev: &MouseDownEvent, window, _cx| {
+                        fh_click.focus(window);
+                    },
+                )
+                .child(grid_elem)
+        } else {
+            // Fallback: plain text lines.
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .p_3()
+                .bg(rgb(color::TERM))
+                .text_color(rgb(color::TEXT))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .id("term-scroll")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .gap_1()
+                        .overflow_y_scroll()
+                        .children(term_content.into_iter().map(|line| {
+                            div().text_xs().text_color(rgb(color::TEXT)).child(line)
+                        })),
+                )
+        };
 
         // ── Fleet sidebar ──────────────────────────────────────────────────────
         // Header with session count, cost, and + buttons.

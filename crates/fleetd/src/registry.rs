@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
 use protocol::{
-    Autonomy, CellSnap, DecisionKind, Event, HookDecision, Session, SessionId, State, Target, Tool,
+    Autonomy, BlockMarker, CellSnap, DecisionKind, Event, HookDecision, Session, SessionId, State,
+    Target, Tool,
 };
 use tokio::sync::{broadcast, oneshot};
 
@@ -171,6 +172,11 @@ impl Registry {
 
     pub fn emit_error(&self, message: String) {
         self.emit(Event::Error { message });
+    }
+
+    /// Broadcast an OSC 133 [`BlockMarker`] detected in a session's PTY output.
+    pub fn emit_block(&self, id: SessionId, marker: BlockMarker) {
+        self.emit(Event::Block { session: id, marker });
     }
 
     /// Broadcast a full styled-cell grid snapshot for `id` to all subscribers.

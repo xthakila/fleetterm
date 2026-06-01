@@ -12,6 +12,7 @@ use protocol::{DecisionKind, Session, SessionId, SpawnSpec, State, Target, Tool}
 use crate::claude;
 use crate::pty::PtySession;
 use crate::registry::Registry;
+use crate::shellinit;
 use crate::tools;
 
 pub struct Daemon {
@@ -56,11 +57,33 @@ impl Daemon {
             cmd.env(k, v);
         }
 
+        // Best-effort shell integration: inject OSC 133 hooks for bash/zsh.
+        // We intentionally ignore errors — a failure here must not abort the spawn.
+        let _shell_init = if matches!(spec.tool, Tool::Shell) {
+            shellinit::apply(&mut cmd, id.0)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(session = %id, "shell integration unavailable: {e}");
+                    None
+                })
+        } else {
+            None
+        };
+
         let reg = self.reg.clone();
         let cb_id = id.clone();
-        let session = PtySession::spawn(cmd, DEFAULT_COLS, DEFAULT_ROWS, move |chunk| {
-            reg.emit_output(cb_id.clone(), chunk);
-        })?;
+        let block_reg = self.reg.clone();
+        let block_id = id.clone();
+        let session = PtySession::spawn(
+            cmd,
+            DEFAULT_COLS,
+            DEFAULT_ROWS,
+            move |chunk| {
+                reg.emit_output(cb_id.clone(), chunk);
+            },
+            move |marker| {
+                block_reg.emit_block(block_id.clone(), marker);
+            },
+        )?;
 
         self.ptys.lock().unwrap().insert(id.clone(), session.clone());
 

@@ -177,6 +177,25 @@ pub struct CellSnap {
     pub inverse: bool,
 }
 
+/// A shell-integration block boundary detected via OSC 133.
+///
+/// These are emitted by shells that source the FleetTerm shell-integration snippet
+/// (see `fleetd::shellinit`). The UI can use them to draw Warp-style command blocks:
+/// each command is bracketed by `PromptStart` → `CommandStart` → `OutputStart` →
+/// `CommandEnd`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockMarker {
+    /// OSC 133 ; A — prompt started rendering (PS1 begin).
+    PromptStart,
+    /// OSC 133 ; B — prompt finished; user is typing the command.
+    CommandStart,
+    /// OSC 133 ; C — command accepted (Enter pressed); output follows.
+    OutputStart,
+    /// OSC 133 ; D — command finished. `exit` is `None` when the shell omitted
+    /// the exit-code suffix (`D` only), or `Some(code)` when it sent `D;N`.
+    CommandEnd { exit: Option<i32> },
+}
+
 /// daemon → UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
@@ -209,6 +228,11 @@ pub enum Event {
         approved: bool,
         reason: String,
     },
+    /// An OSC 133 shell-integration marker was detected in PTY output.
+    ///
+    /// The UI uses these to draw Warp-style command blocks. Markers arrive in
+    /// order A → B → C → D for each user command. See [`BlockMarker`].
+    Block { session: SessionId, marker: BlockMarker },
     Error { message: String },
 }
 

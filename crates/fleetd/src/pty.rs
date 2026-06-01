@@ -16,7 +16,9 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use protocol::CellSnap;
+use protocol::{BlockMarker, CellSnap};
+
+use crate::osc::Scanner as OscScanner;
 
 /// Our own [`Dimensions`] (alacritty's `TermSize` is test-only). Visible screen only;
 /// scrollback history is governed by [`Config::scrolling_history`].
@@ -54,14 +56,20 @@ pub struct PtySession {
 }
 
 impl PtySession {
-    /// Spawn `cmd` on a fresh PTY of the given size. `on_output` is called from the
-    /// reader thread with each raw chunk (used to stream [`protocol::Event::Output`] to
-    /// subscribed UIs); the grid is updated before the callback fires.
+    /// Spawn `cmd` on a fresh PTY of the given size.
+    ///
+    /// * `on_output` — called from the reader thread with each raw PTY chunk; the
+    ///   VT grid is updated before this fires.  Used to stream
+    ///   [`protocol::Event::Output`] to subscribed UIs.
+    /// * `on_block` — called for every [`BlockMarker`] found in the raw output by
+    ///   the OSC 133 scanner.  May be called zero or more times per chunk, before
+    ///   `on_output` returns.  Pass a no-op closure (`|_| {}`) to disable.
     pub fn spawn(
         cmd: CommandBuilder,
         cols: u16,
         rows: u16,
         on_output: impl Fn(Vec<u8>) + Send + 'static,
+        on_block: impl Fn(BlockMarker) + Send + 'static,
     ) -> anyhow::Result<Arc<PtySession>> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
@@ -101,19 +109,25 @@ impl PtySession {
             child_pid,
         });
 
-        // Reader thread: PTY bytes -> VT parser -> grid, then notify.
+        // Reader thread: PTY bytes -> OSC 133 scanner + VT parser -> grid, then notify.
         std::thread::spawn(move || {
             let mut parser: Processor = Processor::new();
+            let mut osc = OscScanner::new();
             let mut buf = [0u8; 8192];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        let chunk = &buf[..n];
+                        // Run the OSC 133 scanner first — it's a pure byte scan, no lock needed.
+                        for marker in osc.scan(chunk) {
+                            on_block(marker);
+                        }
                         {
                             let mut t = term.lock().unwrap();
-                            parser.advance(&mut *t, &buf[..n]);
+                            parser.advance(&mut *t, chunk);
                         }
-                        on_output(buf[..n].to_vec());
+                        on_output(chunk.to_vec());
                     }
                 }
             }
@@ -343,7 +357,7 @@ mod tests {
     fn shell_output_lands_in_the_grid() {
         let mut cmd = CommandBuilder::new("sh");
         cmd.args(["-c", "printf 'fleetterm-grid-ok\\n'; sleep 1"]);
-        let sess = PtySession::spawn(cmd, 80, 24, |_| {}).expect("spawn");
+        let sess = PtySession::spawn(cmd, 80, 24, |_| {}, |_| {}).expect("spawn");
 
         // Poll the grid until the marker shows up (or time out).
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -360,7 +374,7 @@ mod tests {
     #[test]
     fn input_is_echoed_through_the_pty() {
         let mut cmd = CommandBuilder::new("cat");
-        let sess = PtySession::spawn(cmd_with_no_args(&mut cmd), 80, 24, |_| {}).expect("spawn");
+        let sess = PtySession::spawn(cmd_with_no_args(&mut cmd), 80, 24, |_| {}, |_| {}).expect("spawn");
         sess.write_input(b"roundtrip\n").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -383,7 +397,7 @@ mod tests {
         // Spawn a process that writes a known character then sleeps.
         let mut cmd = CommandBuilder::new("sh");
         cmd.args(["-c", "printf 'X'; sleep 5"]);
-        let sess = PtySession::spawn(cmd, 40, 10, |_| {}).expect("spawn");
+        let sess = PtySession::spawn(cmd, 40, 10, |_| {}, |_| {}).expect("spawn");
 
         // Wait for 'X' to land in the grid.
         let deadline = Instant::now() + Duration::from_secs(5);
