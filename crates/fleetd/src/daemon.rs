@@ -2,7 +2,7 @@
 //! map, and turns protocol requests into process actions (spawn / input / resize / stop).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -26,6 +26,10 @@ pub struct Daemon {
     /// The session a UI is currently viewing (for live grid push).
     /// Updated by [`Daemon::request_grid`]; cleared when the session is closed.
     watched: Mutex<Option<SessionId>>,
+    /// Tracks git worktrees created for sessions: session id → (repo root, worktree dir).
+    /// Populated in [`Daemon::spawn`] when `SpawnSpec::worktree_from` is set;
+    /// consumed in [`Daemon::close`] for best-effort cleanup.
+    worktrees: Mutex<HashMap<SessionId, (PathBuf, PathBuf)>>,
 }
 
 const DEFAULT_COLS: u16 = 80;
@@ -40,6 +44,7 @@ impl Daemon {
             run_dir,
             hook_bin,
             watched: Mutex::new(None),
+            worktrees: Mutex::new(HashMap::new()),
         })
     }
 
@@ -52,9 +57,98 @@ impl Daemon {
         let id = self.reg.alloc_id();
         let mut cmd = self.build_command(&spec, id.clone())?;
 
+        // --- git worktree setup (best-effort; failure falls back to spec.cwd) -----------
+        //
+        // When `worktree_from` is set, we create a linked worktree for this session so
+        // parallel agents each get an isolated working copy.  All errors warn + fall back;
+        // they must never abort the spawn.
+        let (effective_cwd, session_branch) = if let Some(ref base) = spec.worktree_from {
+            // Determine the repo root: spec.cwd if given, else current dir.
+            let repo = spec
+                .cwd
+                .as_ref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+            // Verify it's inside a git repo.
+            match run_git(&["-C", &repo.to_string_lossy(), "rev-parse", "--is-inside-work-tree"]) {
+                Ok(out) if out.trim() == "true" => {
+                    // Build worktree dir and branch name.
+                    let sname = spec
+                        .name
+                        .as_deref()
+                        .unwrap_or("agent")
+                        .to_string();
+                    let safe_name = sanitize_name(&sname);
+                    let branch = format!("fleetterm/{}-{}", safe_name, id.0);
+                    let worktree_dir = repo
+                        .join(".fleetterm")
+                        .join("worktrees")
+                        .join(format!("{}-{}", safe_name, id.0));
+
+                    // Create parent dirs.
+                    if let Err(e) = std::fs::create_dir_all(worktree_dir.parent().unwrap_or(&worktree_dir)) {
+                        tracing::warn!(session = %id, "worktree: could not create parent dir: {e}");
+                        (spec.cwd.as_ref().map(PathBuf::from), spec.worktree_from.clone())
+                    } else {
+                        // git worktree add -b <branch> <dir> <base>
+                        match run_git(&[
+                            "-C",
+                            &repo.to_string_lossy(),
+                            "worktree",
+                            "add",
+                            "-b",
+                            &branch,
+                            &worktree_dir.to_string_lossy(),
+                            base,
+                        ]) {
+                            Ok(_) => {
+                                tracing::info!(
+                                    session = %id,
+                                    worktree = %worktree_dir.display(),
+                                    branch = %branch,
+                                    "git worktree created"
+                                );
+                                self.worktrees
+                                    .lock()
+                                    .unwrap()
+                                    .insert(id.clone(), (repo, worktree_dir.clone()));
+                                (Some(worktree_dir), Some(branch))
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    session = %id,
+                                    "worktree add failed ({e}); falling back to spec.cwd"
+                                );
+                                (spec.cwd.as_ref().map(PathBuf::from), spec.worktree_from.clone())
+                            }
+                        }
+                    }
+                }
+                Ok(out) => {
+                    tracing::warn!(
+                        session = %id,
+                        "worktree: not inside a git work tree (got {:?}); falling back",
+                        out.trim()
+                    );
+                    (spec.cwd.as_ref().map(PathBuf::from), spec.worktree_from.clone())
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session = %id,
+                        "worktree: git rev-parse failed ({e}); falling back to spec.cwd"
+                    );
+                    (spec.cwd.as_ref().map(PathBuf::from), spec.worktree_from.clone())
+                }
+            }
+        } else {
+            (spec.cwd.as_ref().map(PathBuf::from), None)
+        };
+        // ---------------------------------------------------------------------------------
+
         cmd.env("FLEETTERM_SESSION", id.0.to_string());
         cmd.env("FLEETTERM_SOCK", self.sock_path.to_string_lossy().to_string());
-        if let Some(cwd) = &spec.cwd {
+        if let Some(ref cwd) = effective_cwd {
             cmd.cwd(cwd);
         }
         for (k, v) in &spec.env {
@@ -98,7 +192,11 @@ impl Daemon {
             tool: spec.tool,
             state: State::Working,
             autonomy: spec.autonomy,
-            branch: spec.worktree_from.clone(),
+            // Use the actual branch we created (or None if worktree setup was not
+            // requested / fell back).  This is the real worktree branch name when
+            // created successfully, the original `worktree_from` value on fallback,
+            // or None when no worktree was requested.
+            branch: session_branch,
             activity: "starting…".into(),
             cost_usd: 0.0,
             context_frac: None,
@@ -300,6 +398,14 @@ impl Daemon {
                 *w = None;
             }
         }
+
+        // Best-effort worktree cleanup.  We only remove the worktree if it is clean
+        // (no uncommitted changes).  On any failure we warn and leave the directory
+        // intact — never destroy uncommitted work.
+        if let Some((repo, worktree_dir)) = self.worktrees.lock().unwrap().remove(id) {
+            cleanup_worktree(id, &repo, &worktree_dir);
+        }
+
         self.reg.remove(id);
     }
 }
@@ -314,4 +420,334 @@ fn default_name(tool: Tool, id: &SessionId) -> String {
         Tool::Other => "agent",
     };
     format!("{prefix}-{}", id.0)
+}
+
+// ---------------------------------------------------------------------------
+// Git worktree helpers
+// ---------------------------------------------------------------------------
+
+/// Run a git command, passing all `args` verbatim.
+///
+/// This intentionally takes the `-C <dir>` argument as part of `args` so callers
+/// can include it (or omit it) explicitly without additional indirection.
+///
+/// Returns `Ok(stdout)` on exit-code 0, or an error containing stderr.
+fn run_git(args: &[&str]) -> Result<String> {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|e| anyhow::anyhow!("git exec failed: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(anyhow::anyhow!(
+            "git {} exited {}: {}",
+            args.join(" "),
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// Replace characters that are invalid in git branch name path components with `-`,
+/// then collapse runs of `-` and strip leading/trailing `-`.
+///
+/// Git branch names must not contain `..`, `~`, `^`, `:`, `?`, `*`, `[`, `\`,
+/// spaces, control chars, or start/end with `.` or `/`.  This function keeps only
+/// ASCII alphanumeric chars and `.` (safe inside a component), replacing everything
+/// else with `-`.
+fn sanitize_name(name: &str) -> String {
+    let raw: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    // Collapse consecutive dashes and trim.
+    let mut result = String::with_capacity(raw.len());
+    let mut last_dash = true; // treat start as dash to strip leading dashes
+    for c in raw.chars() {
+        if c == '-' {
+            if !last_dash {
+                result.push('-');
+                last_dash = true;
+            }
+        } else {
+            result.push(c);
+            last_dash = false;
+        }
+    }
+    // Strip trailing dash.
+    if result.ends_with('-') {
+        result.pop();
+    }
+    if result.is_empty() {
+        "agent".into()
+    } else {
+        result
+    }
+}
+
+/// Best-effort worktree cleanup called from [`Daemon::close`].
+///
+/// Rules:
+/// - If `git status --porcelain` returns empty output → worktree is clean → remove it.
+/// - If there are uncommitted changes → warn and leave the directory untouched.
+/// - On any git error → warn and leave (safe default).
+fn cleanup_worktree(id: &SessionId, repo: &Path, worktree_dir: &Path) {
+    // First check: does the worktree directory still exist?
+    if !worktree_dir.exists() {
+        return;
+    }
+
+    let dir_str = worktree_dir.to_string_lossy();
+
+    // Check cleanliness.
+    match run_git(&["-C", &dir_str, "status", "--porcelain"]) {
+        Ok(output) if output.trim().is_empty() => {
+            // Clean — safe to remove.
+            match run_git(&[
+                "-C",
+                &repo.to_string_lossy(),
+                "worktree",
+                "remove",
+                &dir_str,
+            ]) {
+                Ok(_) => {
+                    tracing::info!(
+                        session = %id,
+                        worktree = %worktree_dir.display(),
+                        "git worktree removed (clean)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session = %id,
+                        worktree = %worktree_dir.display(),
+                        "could not remove worktree: {e}"
+                    );
+                }
+            }
+        }
+        Ok(_) => {
+            tracing::warn!(
+                session = %id,
+                "left dirty worktree {} — contains uncommitted changes, not removing",
+                worktree_dir.display()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                session = %id,
+                "could not check worktree status for {}: {e}",
+                worktree_dir.display()
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // sanitize_name — pure function, no I/O
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_name_strips_special_chars() {
+        assert_eq!(sanitize_name("my agent"), "my-agent");
+        assert_eq!(sanitize_name("fix/auth~bug"), "fix-auth-bug");
+        assert_eq!(sanitize_name("---leading"), "leading");
+        assert_eq!(sanitize_name("trailing---"), "trailing");
+        assert_eq!(sanitize_name("a--b"), "a-b");
+        assert_eq!(sanitize_name(""), "agent");
+        assert_eq!(sanitize_name("---"), "agent");
+        assert_eq!(sanitize_name("hello"), "hello");
+        assert_eq!(sanitize_name("v1.2.3"), "v1.2.3");
+    }
+
+    // -----------------------------------------------------------------------
+    // Branch and worktree path construction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn branch_name_construction() {
+        let id = SessionId(42);
+        let safe_name = sanitize_name("my agent");
+        let branch = format!("fleetterm/{}-{}", safe_name, id.0);
+        assert_eq!(branch, "fleetterm/my-agent-42");
+    }
+
+    #[test]
+    fn worktree_dir_construction() {
+        let repo = PathBuf::from("/home/user/myproject");
+        let id = SessionId(7);
+        let safe_name = sanitize_name("fix/auth bug");
+        let worktree_dir = repo
+            .join(".fleetterm")
+            .join("worktrees")
+            .join(format!("{}-{}", safe_name, id.0));
+        assert_eq!(
+            worktree_dir,
+            PathBuf::from("/home/user/myproject/.fleetterm/worktrees/fix-auth-bug-7")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // run_git — integration test against a real temp repo.
+    //
+    // These tests use only `git` (already required to develop this project)
+    // and temp dirs; they create no PTYs and no tokio runtime.
+    // -----------------------------------------------------------------------
+
+    /// Create a temporary git repo with one commit and return its path.
+    fn init_temp_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().to_string_lossy().to_string();
+
+        // git init
+        std::process::Command::new("git")
+            .args(["-C", &p, "init"])
+            .output()
+            .unwrap();
+        // configure identity for the commit
+        std::process::Command::new("git")
+            .args(["-C", &p, "config", "user.email", "test@test.local"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &p, "config", "user.name", "Test"])
+            .output()
+            .unwrap();
+        // initial commit so HEAD is valid
+        let readme = dir.path().join("README");
+        std::fs::write(&readme, "init").unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &p, "add", "README"])
+            .output()
+            .unwrap();
+        std::process::Command::new("git")
+            .args(["-C", &p, "commit", "-m", "init"])
+            .output()
+            .unwrap();
+
+        dir
+    }
+
+    #[test]
+    fn run_git_succeeds_on_valid_repo() {
+        let repo = init_temp_repo();
+        let p = repo.path().to_string_lossy().to_string();
+        let out = run_git(&["-C", &p, "rev-parse", "--is-inside-work-tree"]).unwrap();
+        assert_eq!(out.trim(), "true");
+    }
+
+    #[test]
+    fn run_git_fails_on_non_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().to_string_lossy().to_string();
+        let result = run_git(&["-C", &p, "rev-parse", "--is-inside-work-tree"]);
+        assert!(result.is_err(), "expected error for non-git dir");
+    }
+
+    #[test]
+    fn worktree_add_and_remove_lifecycle() {
+        let repo_dir = init_temp_repo();
+        let repo = repo_dir.path();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        let id = SessionId(999);
+        let safe_name = sanitize_name("test-agent");
+        let branch = format!("fleetterm/{}-{}", safe_name, id.0);
+        let worktree_dir = repo
+            .join(".fleetterm")
+            .join("worktrees")
+            .join(format!("{}-{}", safe_name, id.0));
+
+        std::fs::create_dir_all(worktree_dir.parent().unwrap()).unwrap();
+
+        // Add the worktree.
+        let result = run_git(&[
+            "-C",
+            &repo_str,
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &worktree_dir.to_string_lossy(),
+            "HEAD",
+        ]);
+        assert!(result.is_ok(), "worktree add failed: {:?}", result);
+
+        // The worktree directory must exist and be a linked worktree.
+        assert!(worktree_dir.exists(), "worktree dir should exist");
+        let list_out = run_git(&["-C", &repo_str, "worktree", "list", "--porcelain"]).unwrap();
+        assert!(
+            list_out.contains(&worktree_dir.to_string_lossy().to_string()),
+            "worktree not in list"
+        );
+
+        // Status should be clean immediately after creation.
+        let status = run_git(&["-C", &worktree_dir.to_string_lossy(), "status", "--porcelain"])
+            .unwrap();
+        assert!(status.trim().is_empty(), "fresh worktree should be clean");
+
+        // Cleanup via cleanup_worktree.
+        cleanup_worktree(&id, repo, &worktree_dir);
+
+        // After clean removal the dir should no longer exist.
+        assert!(
+            !worktree_dir.exists(),
+            "worktree dir should be removed after clean close"
+        );
+    }
+
+    #[test]
+    fn cleanup_worktree_leaves_dirty_worktree_intact() {
+        let repo_dir = init_temp_repo();
+        let repo = repo_dir.path();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        let id = SessionId(888);
+        let safe_name = sanitize_name("dirty-agent");
+        let branch = format!("fleetterm/{}-{}", safe_name, id.0);
+        let worktree_dir = repo
+            .join(".fleetterm")
+            .join("worktrees")
+            .join(format!("{}-{}", safe_name, id.0));
+
+        std::fs::create_dir_all(worktree_dir.parent().unwrap()).unwrap();
+
+        run_git(&[
+            "-C",
+            &repo_str,
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &worktree_dir.to_string_lossy(),
+            "HEAD",
+        ])
+        .unwrap();
+
+        // Dirty the worktree: create an untracked file.
+        std::fs::write(worktree_dir.join("dirty.txt"), "uncommitted").unwrap();
+
+        // cleanup_worktree should leave it in place.
+        cleanup_worktree(&id, repo, &worktree_dir);
+
+        assert!(
+            worktree_dir.exists(),
+            "dirty worktree must NOT be removed — would lose uncommitted work"
+        );
+    }
 }

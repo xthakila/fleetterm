@@ -1,4 +1,4 @@
-//! FleetTerm UI — Phase 2 / 3 / 5 fleet cockpit.
+//! FleetTerm UI — Phase 2 / 3 / 5 / 6 fleet cockpit.
 //!
 //! Connects to `fleetd` over a unix socket (via `client::FleetClient`), renders all agent
 //! sessions in a sidebar, lets the user approve/deny decisions and cycle autonomy, and
@@ -7,6 +7,13 @@
 //! P5 additions:
 //! - View modes: Split (default) | Tiled | Focus — toggled via title-bar chips.
 //! - Cmd-K / Ctrl-K command palette.
+//!
+//! P6 additions:
+//! - Fleet Composer bar: a focusable input row above the status line. Type a command,
+//!   prefix with `@all`, `@working`, or `@<name>` to fan-out; Enter sends it as PTY input.
+//! - Palette now typeable: key strokes accumulate into `palette_query` and filter sessions.
+//! - Command-block indicator: OSC 133 events are tallied per session and shown in the
+//!   terminal pane header (command count, last exit code, running-flag dot).
 //!
 //! API verified against gpui 0.2.2 (new App/Window/Context surface).
 
@@ -54,6 +61,20 @@ const TERM_MAX_LINES: usize = 400;
 /// Maximum session tiles shown in Tiled mode before truncation notice.
 const TILED_MAX: usize = 6;
 
+// ── P6: command-block tracking ────────────────────────────────────────────────
+
+/// Accumulated OSC 133 statistics for one session.
+/// `running` is true between a `CommandStart` / `OutputStart` and the matching `CommandEnd`.
+#[derive(Default, Clone)]
+struct BlockStats {
+    /// How many commands have been run in this session (counts each `CommandStart`).
+    commands: u32,
+    /// Exit code from the most recent `CommandEnd`, or `None` if none seen yet.
+    last_exit: Option<i32>,
+    /// True while a command is executing (between OutputStart and CommandEnd).
+    running: bool,
+}
+
 // ── P5 view mode ─────────────────────────────────────────────────────────────
 
 /// Which layout the main body uses.
@@ -92,8 +113,16 @@ struct FleetTermApp {
     view_mode: ViewMode,
     /// Whether the Cmd-K command palette overlay is open.
     palette_open: bool,
-    /// Search query typed in the palette (v1: display only, not yet wired to fuzzy filter).
+    /// Search query typed in the palette — now wired (P6): filters session jump rows.
     palette_query: String,
+
+    // ── P6 fields ─────────────────────────────────────────────────────────────
+    /// OSC 133 block statistics per session.
+    blocks: HashMap<SessionId, BlockStats>,
+    /// The current text in the fleet composer input bar.
+    composer: String,
+    /// GPUI focus handle for the composer bar (separate from the terminal handle).
+    composer_focus: FocusHandle,
 }
 
 impl FleetTermApp {
@@ -126,6 +155,9 @@ impl FleetTermApp {
             view_mode: ViewMode::Split,
             palette_open: false,
             palette_query: String::new(),
+            blocks: HashMap::new(),
+            composer: String::new(),
+            composer_focus: cx.focus_handle(),
         }
     }
 
@@ -161,6 +193,7 @@ impl FleetTermApp {
                 }
                 self.term_text.remove(&id);
                 self.grids.remove(&id);
+                self.blocks.remove(&id); // P6: clean up block stats.
             }
             Event::Output { session, data } => {
                 let text = String::from_utf8_lossy(&data).into_owned();
@@ -219,8 +252,27 @@ impl FleetTermApp {
             // AutoDecision and Error: silently ignored (could append to a log in the future).
             Event::AutoDecision { .. } => {}
             Event::Error { .. } => {}
-            // Catch-all: forward-compatible with new daemon variants.
-            _ => {}
+            // P6: OSC 133 block markers — update per-session BlockStats.
+            Event::Block { session, marker } => {
+                use protocol::BlockMarker;
+                let stats = self.blocks.entry(session).or_default();
+                match marker {
+                    BlockMarker::CommandStart => {
+                        stats.commands += 1;
+                        stats.running = true;
+                    }
+                    BlockMarker::OutputStart => {
+                        // OutputStart: command accepted, output begins; still running.
+                        stats.running = true;
+                    }
+                    BlockMarker::CommandEnd { exit } => {
+                        stats.running = false;
+                        stats.last_exit = exit;
+                    }
+                    // PromptStart: just a prompt rendering marker — no stats change needed.
+                    BlockMarker::PromptStart => {}
+                }
+            }
         }
     }
 
@@ -256,6 +308,177 @@ impl FleetTermApp {
             let tx = self.requests.clone();
             let target = Target::Session(session_id.clone());
             let _ = tx.try_send(Request::Input { target, data });
+            cx.stop_propagation();
+        }
+    }
+
+    // ── P6: Composer helpers ──────────────────────────────────────────────────
+
+    /// Submit whatever is in `self.composer` as PTY input to the resolved target.
+    /// Parses a leading `@all `, `@working `, or `@<name> ` token.
+    /// Falls back to the focused session when no `@` prefix is present.
+    fn submit_composer(&mut self, cx: &mut Context<Self>) {
+        let text = self.composer.clone();
+        let text = text.trim_end_matches('\n');
+        if text.is_empty() {
+            return;
+        }
+
+        let target = if let Some(rest) = text.strip_prefix("@all ") {
+            let data: Vec<u8> = format!("{}\r", rest).into_bytes();
+            let tx = self.requests.clone();
+            let _ = tx.try_send(Request::Input { target: Target::All, data });
+            self.composer.clear();
+            cx.notify();
+            return;
+        } else if let Some(rest) = text.strip_prefix("@working ") {
+            let data: Vec<u8> = format!("{}\r", rest).into_bytes();
+            let tx = self.requests.clone();
+            let _ = tx.try_send(Request::Input { target: Target::AllWorking, data });
+            self.composer.clear();
+            cx.notify();
+            return;
+        } else if let Some(at_rest) = text.strip_prefix('@') {
+            // @<name> <rest>: find a session whose name matches the token.
+            if let Some(space_pos) = at_rest.find(' ') {
+                let name_token = &at_rest[..space_pos];
+                let rest = &at_rest[space_pos + 1..];
+                let maybe_id = self
+                    .sessions
+                    .values()
+                    .find(|s| s.name == name_token)
+                    .map(|s| s.id.clone());
+                if let Some(id) = maybe_id {
+                    let data: Vec<u8> = format!("{}\r", rest).into_bytes();
+                    let tx = self.requests.clone();
+                    let _ = tx.try_send(Request::Input { target: Target::Session(id), data });
+                    self.composer.clear();
+                    cx.notify();
+                }
+                // Unknown @name — do nothing (keep composer so user can correct).
+                return;
+            } else {
+                // Bare "@something" with no space yet — do nothing, user hasn't typed the command yet.
+                return;
+            }
+        } else {
+            // No @ prefix: send to focused session.
+            if let Some(ref id) = self.focused.clone() {
+                Target::Session(id.clone())
+            } else {
+                return;
+            }
+        };
+
+        let data: Vec<u8> = format!("{}\r", text).into_bytes();
+        let tx = self.requests.clone();
+        let _ = tx.try_send(Request::Input { target, data });
+        self.composer.clear();
+        cx.notify();
+    }
+
+    /// Handle a key event directed at the composer bar.
+    fn on_composer_key_down(
+        &mut self,
+        ev: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ctrl = ev.keystroke.modifiers.control;
+        let platform = ev.keystroke.modifiers.platform; // Cmd on macOS
+        let key = ev.keystroke.key.as_str();
+
+        if key == "escape" {
+            // Defocus composer (just stop_propagation; root will not eat this since
+            // palette is not open and root key handler only cares about escape-while-palette).
+            cx.stop_propagation();
+            return;
+        }
+
+        if key == "enter" {
+            self.submit_composer(cx);
+            cx.stop_propagation();
+            return;
+        }
+
+        if key == "backspace" && !ctrl && !platform {
+            self.composer.pop();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        if key == "space" && !ctrl && !platform {
+            self.composer.push(' ');
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        // Printable single-char key (letters, digits, punctuation).
+        // Shift is already folded into the key string by GPUI (e.g. "A" for shift-a).
+        if key.chars().count() == 1 && !ctrl && !platform {
+            self.composer.push_str(key);
+            cx.notify();
+            cx.stop_propagation();
+        }
+    }
+
+    /// Handle a key event directed at the command palette (when palette_open).
+    fn on_palette_key_down(
+        &mut self,
+        ev: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ctrl = ev.keystroke.modifiers.control;
+        let platform = ev.keystroke.modifiers.platform;
+        let key = ev.keystroke.key.as_str();
+
+        if key == "escape" {
+            self.palette_open = false;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        if key == "enter" {
+            // Jump to the first session row that matches palette_query.
+            let query = self.palette_query.to_lowercase();
+            if let Some(id) = self
+                .sessions
+                .values()
+                .find(|s| query.is_empty() || s.name.to_lowercase().contains(&query))
+                .map(|s| s.id.clone())
+            {
+                self.focused = Some(id.clone());
+                let tx = self.requests.clone();
+                let _ = tx.try_send(Request::RequestGrid(id));
+            }
+            self.palette_open = false;
+            self.palette_query.clear();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        if key == "backspace" && !ctrl && !platform {
+            self.palette_query.pop();
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        if key == "space" && !ctrl && !platform {
+            self.palette_query.push(' ');
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
+
+        if key.chars().count() == 1 && !ctrl && !platform {
+            self.palette_query.push_str(key);
+            cx.notify();
             cx.stop_propagation();
         }
     }
@@ -390,6 +613,16 @@ impl Render for FleetTermApp {
         let palette_open = self.palette_open;
         let palette_query = self.palette_query.clone();
 
+        // ── P6: Snapshot composer + block stats ───────────────────────────────
+        let composer_text = self.composer.clone();
+        let composer_focus = self.composer_focus.clone();
+        // Clone block stats for the focused session (if any).
+        let focused_block_stats: Option<BlockStats> = self
+            .focused
+            .as_ref()
+            .and_then(|id| self.blocks.get(id))
+            .cloned();
+
         // ── Title bar ─────────────────────────────────────────────────────────
         // View mode toggle chips
         let chip_split_active = view_mode == ViewMode::Split;
@@ -467,6 +700,74 @@ impl Render for FleetTermApp {
                     .child(SharedString::from(format!("${:.2}", total_cost))),
             );
 
+        // ── P6: Command-block indicator bar ───────────────────────────────────
+        // Shown at the top of the terminal pane when OSC 133 data is available
+        // for the focused session.  Subtle: same bg as HEAD, thin border at bottom.
+        let block_indicator: Option<gpui::AnyElement> = focused_block_stats.map(|stats| {
+            // Running dot: amber while executing.
+            let running_part: gpui::AnyElement = if stats.running {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .rounded_full()
+                            .bg(rgb(color::AMBER)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(color::AMBER))
+                            .child(SharedString::from("running")),
+                    )
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            };
+
+            // Exit code badge.
+            let exit_part: gpui::AnyElement = match stats.last_exit {
+                None => div().into_any_element(),
+                Some(code) => {
+                    let (label, clr) = if code == 0 {
+                        (format!("exit {}", code), color::GREEN)
+                    } else {
+                        (format!("exit {}", code), color::RED)
+                    };
+                    div()
+                        .text_xs()
+                        .text_color(rgb(clr))
+                        .child(SharedString::from(label))
+                        .into_any_element()
+                }
+            };
+
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .h(px(22.0))
+                .bg(rgb(color::HEAD))
+                .border_b_1()
+                .border_color(rgb(color::BORDER))
+                // Command count
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(color::MUT))
+                        .child(SharedString::from(format!("⎇ {} cmds", stats.commands))),
+                )
+                .child(exit_part)
+                .child(running_part)
+                .into_any_element()
+        });
+
         // ── Terminal pane ──────────────────────────────────────────────────────
         // When a `Event::Grid` has been received for the focused session, render it
         // as a real cell-grid (Layer 1 bg quads + Layer 2 glyphs + Layer 3 cursor)
@@ -496,6 +797,8 @@ impl Render for FleetTermApp {
                         fh_click.focus(window);
                     },
                 )
+                // P6: block indicator at the top (conditionally).
+                .when_some(block_indicator, |d, bar| d.child(bar))
                 .child(grid_elem)
         } else {
             // Fallback: plain text lines.
@@ -862,6 +1165,62 @@ impl Render for FleetTermApp {
                     }),
             );
 
+        // ── P6: Fleet Composer bar ─────────────────────────────────────────────
+        // A focusable input row that lets the operator type a command and send it to
+        // one or many sessions.  Sits above the status line; clicking it steals focus
+        // from the terminal pane.
+        //
+        // Caret: we append a block-cursor "█" glyph when the composer is focused.
+        // Since we cannot query `is_focused` without window state during render, we
+        // always show the caret when the composer is non-empty OR as a static prompt.
+        // (A future improvement could use Window::is_focused(&composer_focus) once the
+        //  GPUI 0.2.x API stabilises for querying focus state in render.)
+        let composer_display = {
+            let prompt = "❯ ";
+            // Show the typed text; append "█" as a visible caret.
+            let text = format!("{}{}█", prompt, composer_text);
+            SharedString::from(text)
+        };
+        let composer_focus_click = composer_focus.clone();
+        let composer_bar = div()
+            .id("composer-bar")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(32.0))
+            .bg(rgb(color::BG))
+            .border_t_1()
+            .border_color(rgb(color::BORDER))
+            .track_focus(&composer_focus)
+            // Clicking the bar focuses it so key events route here.
+            .on_mouse_down(
+                MouseButton::Left,
+                move |_ev: &MouseDownEvent, window, _cx| {
+                    composer_focus_click.focus(window);
+                },
+            )
+            // Key handler: accumulate into composer, enter = submit.
+            .on_key_down(cx.listener(FleetTermApp::on_composer_key_down))
+            // Composer text (prompt + typed text + caret)
+            .child(
+                div()
+                    .flex_1()
+                    .text_xs()
+                    .text_color(rgb(color::TEXT))
+                    .child(composer_display),
+            )
+            // Hint
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(color::MUT))
+                    .child(SharedString::from(
+                        "@name / @all / @working to target · ⏎ send",
+                    )),
+            );
+
         // ── Status line ────────────────────────────────────────────────────────
         // Per-session segments in the footer.
         let status_segments = sorted_sessions.iter().enumerate().map(|(i, s)| {
@@ -1050,17 +1409,24 @@ impl Render for FleetTermApp {
             }
         };
 
-        // ── P5: Command palette overlay ────────────────────────────────────────
+        // ── P5/P6: Command palette overlay ────────────────────────────────────
         // The palette is layered as an absolute child of the root so it sits above
         // everything else.  Pattern from gpui's own FallbackPromptRenderer (prompts.rs):
         // parent is relative, palette is absolute + top_0 + left_0 + size_full.
         //
-        // Palette v1: lists sessions (jump), "+ new shell", "+ new claude",
-        // "approve next ⚑".  Fuzzy filtering against palette_query is noted but
-        // deferred — the query field is captured for display.
+        // P6: palette_query is now typeable (routed via root on_key_down when
+        // palette_open) and session rows are filtered by substring match.
 
-        // Build the session jump rows.
-        let palette_sessions: Vec<Session> = sorted_sessions.clone();
+        // Build the session jump rows — filtered by palette_query (case-insensitive).
+        let palette_query_lower = palette_query.to_lowercase();
+        let palette_sessions: Vec<Session> = sorted_sessions
+            .iter()
+            .filter(|s| {
+                palette_query_lower.is_empty()
+                    || s.name.to_lowercase().contains(&palette_query_lower)
+            })
+            .cloned()
+            .collect();
         let palette_open_inner = palette_open;
 
         // Collect info for the "approve next NeedsInput" action.
@@ -1160,17 +1526,21 @@ impl Render for FleetTermApp {
                 this.palette_open = !this.palette_open;
                 cx.notify();
             }))
-            // Close palette on Escape (handled as raw key_down; action-based close is also
-            // possible but requires registering an Escape binding which might conflict).
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
-                if this.palette_open && ev.keystroke.key.as_str() == "escape" {
-                    this.palette_open = false;
-                    cx.notify();
-                    cx.stop_propagation();
+            // P5/P6: Keyboard routing on the root element.
+            // When the palette is open, every key event is consumed by the palette
+            // (accumulate into palette_query, enter jumps, escape closes).
+            // When the palette is closed, only Escape is handled here (terminal pane
+            // handles all other keys via its own on_key_down + focus_handle).
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if this.palette_open {
+                    this.on_palette_key_down(ev, window, cx);
                 }
+                // When palette is closed, let other handlers (terminal, composer) take over.
             }))
             .child(title_bar)
             .child(body)
+            // P6: Fleet composer bar — sits above the status line.
+            .child(composer_bar)
             .child(status_line)
             // ── Palette overlay (conditionally rendered) ───────────────────────
             // Pattern: absolute child covering the full root.  The palette panel itself
@@ -1219,7 +1589,7 @@ impl Render for FleetTermApp {
                                 .border_color(rgb(color::BORDER))
                                 .bg(rgb(color::PALETTE_BG))
                                 .overflow_hidden()
-                                // Query prompt (v1: display only, not yet interactive).
+                                // Query prompt — P6: now typeable via root on_key_down.
                                 .child(
                                     div()
                                         .flex()
@@ -1242,15 +1612,14 @@ impl Render for FleetTermApp {
                                                 .flex_1()
                                                 .text_xs()
                                                 .text_color(rgb(color::TEXT))
-                                                .child(SharedString::from(
+                                                .child(SharedString::from({
+                                                    // Show typed query with caret, or placeholder.
                                                     if palette_query.is_empty() {
-                                                        "Search commands and sessions…"
+                                                        "Search commands and sessions…█".to_owned()
                                                     } else {
-                                                        // In v1, the query is display-only.
-                                                        // Full typing requires EntityInputHandler.
-                                                        "Search commands and sessions…"
-                                                    },
-                                                )),
+                                                        format!("{}█", palette_query)
+                                                    }
+                                                })),
                                         ),
                                 )
                                 // Scrollable list of actions + sessions.

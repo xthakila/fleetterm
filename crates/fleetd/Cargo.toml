@@ -27,3 +27,7 @@ portable-pty = "0.9"
 alacritty_terminal = "0.26"
 # SIGSTOP / SIGCONT for pause/resume
 nix = { version = "0.29", features = ["signal"] }
+
+[dev-dependencies]
+# Used in daemon.rs unit tests for temporary git repos (worktree lifecycle tests).
+tempfile = "3"
