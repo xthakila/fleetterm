@@ -123,6 +123,10 @@ struct FleetTermApp {
     composer: String,
     /// GPUI focus handle for the composer bar (separate from the terminal handle).
     composer_focus: FocusHandle,
+
+    // ── Bug-fix: PTY resize tracking ──────────────────────────────────────────
+    /// Last (session, cols, rows) sent via Request::Resize, to avoid redundant sends.
+    last_sent_size: Option<(SessionId, u16, u16)>,
 }
 
 impl FleetTermApp {
@@ -158,6 +162,7 @@ impl FleetTermApp {
             blocks: HashMap::new(),
             composer: String::new(),
             composer_focus: cx.focus_handle(),
+            last_sent_size: None,
         }
     }
 
@@ -562,7 +567,72 @@ fn view_mode_chip(label: &'static str, active: bool) -> gpui::Div {
 // ── Render ────────────────────────────────────────────────────────────────────
 
 impl Render for FleetTermApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // ── Bug fix (B2): Resize the focused session's PTY to fit the pane. ──
+        // Compute monospace cell metrics from the window's current text style.
+        // This mirrors the exact calls in terminal.rs::request_layout so the grid
+        // dimensions stay in lock-step with what the GridElement will actually paint.
+        {
+            let style = window.text_style();
+            let font_id = window.text_system().resolve_font(&style.font());
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let cell_w = window
+                .text_system()
+                .em_advance(font_id, font_size)
+                .unwrap_or(px(8.0));
+            let line_h = window.line_height();
+
+            let viewport = window.viewport_size();
+
+            // Estimate the terminal pane area:
+            //   Split mode: subtract sidebar (320px) and left border (~1px) from width.
+            //   Focus mode: full width (no sidebar).
+            //   Tiled mode: no single terminal pane — skip resize.
+            // Heights: subtract title bar (40px) + status bar (28px) + composer (32px)
+            //          + 8px padding margin.
+            let sidebar_w: f32 = if self.view_mode == ViewMode::Split { 321.0 } else { 0.0 };
+            let chrome_h: f32 = 40.0 + 28.0 + 32.0 + 8.0; // titlebar + status + composer + pad
+
+            let pane_w = f32::from(viewport.width) - sidebar_w;
+            let pane_h = f32::from(viewport.height) - chrome_h;
+
+            let cell_w_f32 = f32::from(cell_w);
+            let line_h_f32 = f32::from(line_h);
+
+            let cols = if cell_w_f32 > 0.0 {
+                ((pane_w / cell_w_f32) as u16).max(20)
+            } else {
+                80
+            };
+            let rows = if line_h_f32 > 0.0 {
+                ((pane_h / line_h_f32) as u16).max(6)
+            } else {
+                24
+            };
+
+            // Only send Resize when the target (session, cols, rows) has changed.
+            // Sending in render is acceptable because it is guarded by this change-check
+            // and does NOT call cx.notify() (which would trigger an infinite render loop).
+            if self.view_mode != ViewMode::Tiled {
+                if let Some(ref fid) = self.focused.clone() {
+                    let needs_send = match &self.last_sent_size {
+                        Some((last_id, last_cols, last_rows)) => {
+                            last_id != fid || *last_cols != cols || *last_rows != rows
+                        }
+                        None => true,
+                    };
+                    if needs_send {
+                        let _ = self.requests.try_send(Request::Resize {
+                            session: fid.clone(),
+                            cols,
+                            rows,
+                        });
+                        self.last_sent_size = Some((fid.clone(), cols, rows));
+                    }
+                }
+            }
+        }
+
         let (needs, working, done) = self.counts();
         let n_sessions = self.sessions.len();
         let total_cost = self.total_cost;
@@ -924,36 +994,37 @@ impl Render for FleetTermApp {
             .collect();
 
         // Helper that builds one session card row.
-        // We can't use a free function here because we need to capture closures that
-        // send requests — so we inline the build.  The per-session data (id, autonomy,
-        // state) is cloned into each listener closure.
-        let build_row = |s: &Session, show_buttons: bool, requests: Sender<Request>, focused_id: Option<SessionId>| {
-            let sid_auto = s.id.clone();
-            let sid_approve = s.id.clone();
-            let sid_deny = s.id.clone();
-            let sid_focus = s.id.clone();
+        // Bug fix (B1): all click handlers now use cx.listener so they can mutate
+        // FleetTermApp state directly (set self.focused, self.sessions autonomy) and
+        // call cx.notify() for an immediate repaint — giving instant visual feedback.
+        //
+        // Autonomy pill and action buttons stop event propagation so the outer
+        // card-click handler does not also fire.
+        //
+        // IMPORTANT: build_row captures cx (for cx.listener calls). It is scoped
+        // inside a block so that the cx borrow is released before the later palette
+        // cx.listener calls further down in render.
+        let (needs_rows, working_rows, done_rows) = {
+        let build_row = |s: &Session, show_buttons: bool| {
+            let id = s.id.clone();
+            let id_for_auto = s.id.clone();
+            let id_for_approve = s.id.clone();
+            let id_for_deny = s.id.clone();
             let current_autonomy = s.autonomy;
             let is_focused = focused_id.as_ref() == Some(&s.id);
 
             let (auto_label, auto_color) = autonomy_badge(s.autonomy);
             let dot_c = dot_color(&s.state);
-            let branch_label = s
-                .branch
-                .as_deref()
-                .unwrap_or("-")
-                .to_owned();
+            let branch_label = s.branch.as_deref().unwrap_or("-").to_owned();
             let tool_label = format!("{:?}", s.tool);
             let name_label = s.name.clone();
             let activity_label = s.activity.clone();
 
-            let tx_auto = requests.clone();
-            let tx_approve = requests.clone();
-            let tx_deny = requests.clone();
-            let tx_focus = requests.clone();
-
             let row_bg = if is_focused { color::BORDER } else { color::SIDE };
 
-            // Autonomy pill button — on click cycles autonomy.
+            // Autonomy pill — cycles Manual→Guarded→Auto; optimistically updates
+            // local state for instant feedback, then sends the daemon request.
+            // Stops propagation so the card-click focus handler does not also fire.
             let autonomy_pill = div()
                 .text_xs()
                 .px_1()
@@ -963,17 +1034,23 @@ impl Render for FleetTermApp {
                 .child(SharedString::from(auto_label))
                 .on_mouse_down(
                     MouseButton::Left,
-                    move |_ev: &MouseDownEvent, _window, _cx| {
+                    cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
                         let next = match current_autonomy {
                             Autonomy::Manual => Autonomy::Guarded,
                             Autonomy::Guarded => Autonomy::Auto,
                             Autonomy::Auto => Autonomy::Manual,
                         };
-                        let _ = tx_auto.try_send(Request::SetAutonomy {
-                            session: sid_auto.clone(),
+                        // Optimistic local update so the pill re-renders immediately.
+                        if let Some(session) = this.sessions.get_mut(&id_for_auto) {
+                            session.autonomy = next;
+                        }
+                        let _ = this.requests.try_send(Request::SetAutonomy {
+                            session: id_for_auto.clone(),
                             level: next,
                         });
-                    },
+                        cx.stop_propagation();
+                        cx.notify();
+                    }),
                 );
 
             // Name + autonomy + branch row.
@@ -1007,6 +1084,7 @@ impl Render for FleetTermApp {
                 .child(SharedString::from(tool_label));
 
             // Approve / Deny buttons (shown only in NEEDS YOU group).
+            // Both stop propagation to prevent the card-click from also firing.
             let buttons_row = if show_buttons {
                 let approve = div()
                     .text_xs()
@@ -1018,13 +1096,15 @@ impl Render for FleetTermApp {
                     .child(SharedString::from("Approve"))
                     .on_mouse_down(
                         MouseButton::Left,
-                        move |_ev: &MouseDownEvent, _window, _cx| {
-                            let _ = tx_approve.try_send(Request::Decide {
-                                session: sid_approve.clone(),
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            let _ = this.requests.try_send(Request::Decide {
+                                session: id_for_approve.clone(),
                                 approve: true,
                                 instruction: None,
                             });
-                        },
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
                     );
                 let deny = div()
                     .text_xs()
@@ -1036,13 +1116,15 @@ impl Render for FleetTermApp {
                     .child(SharedString::from("Deny"))
                     .on_mouse_down(
                         MouseButton::Left,
-                        move |_ev: &MouseDownEvent, _window, _cx| {
-                            let _ = tx_deny.try_send(Request::Decide {
-                                session: sid_deny.clone(),
+                        cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                            let _ = this.requests.try_send(Request::Decide {
+                                session: id_for_deny.clone(),
                                 approve: false,
                                 instruction: None,
                             });
-                        },
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
                     );
                 div()
                     .flex()
@@ -1055,7 +1137,8 @@ impl Render for FleetTermApp {
                 div()
             };
 
-            // The full card — clicking focuses the session in the terminal pane.
+            // The full card — clicking immediately sets self.focused (instant highlight)
+            // AND requests a fresh grid from the daemon.
             div()
                 .flex()
                 .flex_row()
@@ -1079,16 +1162,31 @@ impl Render for FleetTermApp {
                 )
                 .on_mouse_down(
                     MouseButton::Left,
-                    move |_ev: &MouseDownEvent, _window, _cx| {
-                        // NOTE: we cannot call self.focus_session here — listeners passed to
-                        // on_mouse_down outside cx.listener don't have Entity access.
-                        // Sending RequestGrid causes Output events → apply() auto-sets focused.
-                        let _ = tx_focus.try_send(Request::RequestGrid(sid_focus.clone()));
-                    },
+                    cx.listener(move |this, _ev: &MouseDownEvent, _window, cx| {
+                        this.focused = Some(id.clone());
+                        let _ = this.requests.try_send(Request::RequestGrid(id.clone()));
+                        cx.notify();
+                    }),
                 )
         };
 
-        // Build group sections.
+        // Collect session rows; build_row captures cx via closure.
+        let nr = needs_you_sessions
+            .iter()
+            .map(|s| build_row(s, true))
+            .collect::<Vec<_>>();
+        let wr = working_sessions
+            .iter()
+            .map(|s| build_row(s, false))
+            .collect::<Vec<_>>();
+        let dr = done_sessions
+            .iter()
+            .map(|s| build_row(s, false))
+            .collect::<Vec<_>>();
+        (nr, wr, dr)
+        }; // end of build_row scope — closure dropped here, releasing the cx borrow
+
+        // Build group label helper (no cx capture needed).
         let group_label = |text: &'static str, color: u32| {
             div()
                 .text_xs()
@@ -1097,27 +1195,6 @@ impl Render for FleetTermApp {
                 .text_color(rgb(color))
                 .child(SharedString::from(text))
         };
-
-        let tx = requests_tx.clone();
-        let f_id = focused_id.clone();
-        let needs_rows = needs_you_sessions
-            .iter()
-            .map(|s| build_row(s, true, tx.clone(), f_id.clone()))
-            .collect::<Vec<_>>();
-
-        let tx2 = requests_tx.clone();
-        let f_id2 = focused_id.clone();
-        let working_rows = working_sessions
-            .iter()
-            .map(|s| build_row(s, false, tx2.clone(), f_id2.clone()))
-            .collect::<Vec<_>>();
-
-        let tx3 = requests_tx.clone();
-        let f_id3 = focused_id.clone();
-        let done_rows = done_sessions
-            .iter()
-            .map(|s| build_row(s, false, tx3.clone(), f_id3.clone()))
-            .collect::<Vec<_>>();
 
         let sidebar = div()
             .flex()
