@@ -32,8 +32,10 @@ pub struct Daemon {
     worktrees: Mutex<HashMap<SessionId, (PathBuf, PathBuf)>>,
 }
 
-const DEFAULT_COLS: u16 = 80;
-const DEFAULT_ROWS: u16 = 24;
+// Larger default so a fresh terminal fills a typical pane before the UI sends an
+// exact Resize; the UI resizes to the real pane on focus.
+const DEFAULT_COLS: u16 = 120;
+const DEFAULT_ROWS: u16 = 40;
 
 impl Daemon {
     pub fn new(sock_path: PathBuf, run_dir: PathBuf, hook_bin: PathBuf) -> Arc<Self> {
@@ -285,14 +287,22 @@ impl Daemon {
                     let idle = last_change.elapsed();
 
                     if let Some(new_state) = tools::infer_state(poll_tool, &current_line, idle) {
-                        let activity = match &new_state {
-                            State::Stuck => "no progress detected".to_string(),
-                            State::NeedsInput(DecisionKind::Question { prompt }) => {
-                                format!("waiting: {}", prompt)
-                            }
-                            _ => String::new(),
-                        };
-                        poll_reg.set_state(&poll_id, new_state, activity);
+                        // Only emit on an actual state change — never re-broadcast the
+                        // same state every poll (that floods the UI; found by launching).
+                        let changed = poll_reg
+                            .get(&poll_id)
+                            .map(|s| s.state != new_state)
+                            .unwrap_or(false);
+                        if changed {
+                            let activity = match &new_state {
+                                State::Idle => "idle — ready".to_string(),
+                                State::NeedsInput(DecisionKind::Question { prompt }) => {
+                                    format!("waiting: {}", prompt)
+                                }
+                                _ => String::new(),
+                            };
+                            poll_reg.set_state(&poll_id, new_state, activity);
+                        }
                     }
                 }
             });
