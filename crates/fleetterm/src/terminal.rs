@@ -157,12 +157,15 @@ fn bg_spans(grid: &GridState, row: u16) -> Vec<BgSpan> {
 
 // ── text run builder ──────────────────────────────────────────────────────────
 
+/// The monospace family for the terminal grid. MUST be an installed font, and the SAME
+/// font used for both cell-width measurement (em_advance) and glyph shaping — otherwise
+/// the glyph advances don't match the cell pitch and every column drifts. "Zed Mono"
+/// (the prior value) is not installed here; DejaVu Sans Mono ships on virtually all Linux.
+const MONO: &str = "DejaVu Sans Mono";
+
 /// For one row, build the display string + `TextRun` vec (fg + bold merged; bg = None).
-///
-/// Using `font("Zed Mono")` which is the monospace family FleetTerm uses.
-/// The font name falls back to the theme monospace via GPUI's font stack.
 fn build_row_runs(grid: &GridState, row: u16) -> (SharedString, Vec<TextRun>) {
-    let base_font = font("Zed Mono");
+    let base_font = font(MONO);
     let mut text = String::with_capacity(grid.cols as usize);
     let mut runs: Vec<TextRun> = Vec::new();
 
@@ -263,7 +266,7 @@ impl Element for GridElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         // Size the layout block to exactly cols×rows cells.
         let style = window.text_style();
-        let font_id = window.text_system().resolve_font(&style.font());
+        let font_id = window.text_system().resolve_font(&font(MONO));
         let font_size = style.font_size.to_pixels(window.rem_size());
         let cell_w = window
             .text_system()
@@ -290,7 +293,7 @@ impl Element for GridElement {
     ) -> Self::PrepaintState {
         // Measure once.
         let style = window.text_style();
-        let font_id = window.text_system().resolve_font(&style.font());
+        let font_id = window.text_system().resolve_font(&font(MONO));
         let font_size = style.font_size.to_pixels(window.rem_size());
         let cell_w = window
             .text_system()
