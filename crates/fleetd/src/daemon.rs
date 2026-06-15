@@ -252,7 +252,39 @@ impl Daemon {
             context_frac: None,
         });
 
-        if let Some(opening) = &spec.opening {
+        // Sending the opening prompt. Claude shows a "trust this folder?" dialog on first
+        // launch in a directory, which swallows an immediately-typed prompt — so for
+        // Claude we run a primer: wait for it to render, accept the trust dialog (Enter →
+        // default "Yes, I trust"), then send the prompt. Shells take the prompt directly.
+        if matches!(spec.tool, Tool::Claude) {
+            let sess = session.clone();
+            let opening = spec.opening.clone();
+            tokio::spawn(async move {
+                // Poll up to ~15s. The trust dialog renders AFTER a loading banner, so we
+                // must NOT assume "ready" just because the screen is non-empty — keep
+                // watching specifically for the dialog, accept it, then send the prompt.
+                for _ in 0..60 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
+                    let screen = sess.screen_text().to_lowercase();
+                    if screen.contains("trust this folder") || screen.contains("do you trust") {
+                        // Accept the highlighted default (1. Yes, I trust) with Enter.
+                        let _ = sess.write_input(b"\r");
+                        tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
+                        break;
+                    }
+                    // Already-trusted dir: claude shows its input UI (shortcuts hint) → ready.
+                    if screen.contains("for shortcuts") || screen.contains("bypassing permissions") {
+                        break;
+                    }
+                }
+                if let Some(open) = opening {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
+                    let mut line = open;
+                    line.push('\r');
+                    let _ = sess.write_input(line.as_bytes());
+                }
+            });
+        } else if let Some(opening) = &spec.opening {
             let mut line = opening.clone();
             line.push('\r');
             let _ = session.write_input(line.as_bytes());
