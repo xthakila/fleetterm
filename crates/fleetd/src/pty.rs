@@ -8,7 +8,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::term::cell::Flags;
@@ -136,11 +136,18 @@ impl PtySession {
         Ok(session)
     }
 
-    /// Write bytes (keystrokes / a prompt) to the child's stdin.
+    /// Write bytes (keystrokes / a prompt) to the child's stdin. Typing snaps the
+    /// viewport back to the live screen so you're never stuck scrolled up in history.
     pub fn write_input(&self, data: &[u8]) -> std::io::Result<()> {
+        self.term.lock().unwrap().scroll_display(Scroll::Bottom);
         let mut w = self.writer.lock().unwrap();
         w.write_all(data)?;
         w.flush()
+    }
+
+    /// Scroll the viewport through scrollback. Positive = up (history), negative = down.
+    pub fn scroll(&self, lines: i32) {
+        self.term.lock().unwrap().scroll_display(Scroll::Delta(lines));
     }
 
     /// Resize both the PTY and the VT grid (must stay in lock-step).

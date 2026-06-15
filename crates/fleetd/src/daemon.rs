@@ -353,6 +353,14 @@ impl Daemon {
         }
     }
 
+    /// Scroll a session through scrollback, then re-emit its grid so the UI updates.
+    pub fn scroll(&self, id: &SessionId, lines: i32) {
+        if let Some(p) = self.pty(id) {
+            p.scroll(lines);
+        }
+        self.request_grid(id);
+    }
+
     pub fn pause(&self, target: &Target) {
         for id in self.reg.resolve_targets(target) {
             if let Some(p) = self.pty(&id) {

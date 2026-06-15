@@ -158,6 +158,9 @@ pub enum Request {
     Resize { session: SessionId, cols: u16, rows: u16 },
     /// Ask for the full server-side grid of a session (on attach/focus).
     RequestGrid(SessionId),
+    /// Scroll the session's viewport through scrollback history. Positive `lines`
+    /// scrolls up (into history); negative scrolls back down toward the live screen.
+    Scroll { session: SessionId, lines: i32 },
     Close(SessionId),
 }
 

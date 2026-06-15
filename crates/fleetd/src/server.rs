@@ -128,6 +128,7 @@ fn handle_request(daemon: &Arc<Daemon>, req: Request) {
             rows,
         } => daemon.resize(&session, cols, rows),
         Request::RequestGrid(id) => daemon.request_grid(&id),
+        Request::Scroll { session, lines } => daemon.scroll(&session, lines),
         Request::Close(id) => daemon.close(&id),
         Request::Subscribe => {}
     }

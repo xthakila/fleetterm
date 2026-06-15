@@ -25,8 +25,8 @@ use std::collections::{BTreeMap, HashMap};
 use async_channel::Sender;
 use gpui::{
     KeyBinding, actions, div, prelude::*, px, relative, rgb, size, App, Application, Bounds,
-    Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, SharedString,
-    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
+    Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, ScrollDelta,
+    ScrollWheelEvent, SharedString, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use protocol::{Autonomy, Event, Request, Session, SessionId, SpawnSpec, State, Target, Tool};
 
@@ -314,6 +314,24 @@ impl FleetTermApp {
             let target = Target::Session(session_id.clone());
             let _ = tx.try_send(Request::Input { target, data });
             cx.stop_propagation();
+        }
+    }
+
+    /// Mouse-wheel over the terminal scrolls the session's scrollback. Positive wheel
+    /// (up) scrolls into history; new keystrokes snap back to the live screen (daemon-side).
+    fn on_term_scroll(&mut self, ev: &ScrollWheelEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        let Some(ref session_id) = self.focused else {
+            return;
+        };
+        let lines = match ev.delta {
+            ScrollDelta::Lines(p) => p.y.round() as i32,
+            ScrollDelta::Pixels(p) => (f32::from(p.y) / 18.0).round() as i32,
+        };
+        if lines != 0 {
+            let _ = self.requests.try_send(Request::Scroll {
+                session: session_id.clone(),
+                lines,
+            });
         }
     }
 
@@ -859,6 +877,7 @@ impl Render for FleetTermApp {
                 .bg(rgb(color::TERM))
                 .overflow_hidden()
                 .track_focus(&focus_handle)
+                .on_scroll_wheel(cx.listener(FleetTermApp::on_term_scroll))
                 .key_context("Terminal")
                 .on_key_down(cx.listener(FleetTermApp::on_term_key_down))
                 .on_mouse_down(
