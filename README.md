@@ -9,8 +9,10 @@ the agent that's blocked, and type into each window. FleetTerm treats **agents a
 processes the terminal is built around** — with a persistent fleet sidebar, attention routing,
 and per-agent **autonomy** so you *supervise by exception* instead of babysitting.
 
-> Status: **early build.** Phase 0–1 (terminal core + daemon) in progress. See
-> [the plan](#roadmap) and `~/.claude/plans/lively-puzzling-pretzel.md`.
+> Status: **working v1.** P0–P6 shipped — GPU terminal (styled cell grid + keyboard +
+> scrollback), fleet cockpit (sidebar, decisions inbox, autonomy, views, ⌘K palette,
+> composer), multi-tool, git-worktree spawn, and inter-agent pipelines. 66 tests green;
+> runs live. See [roadmap](#roadmap). Repo: https://github.com/xthakila/fleetterm
 
 ## Why it's different
 
@@ -79,9 +81,11 @@ target/debug/fleetterm                # the cockpit window
 - **P3** Autonomy engine + pause/resume + per-session controls — ✅ (`@all` composer pending). *(the leap)*
 - **P4** Multi-tool heuristic adapters (codex/aider/gemini) — ✅ (spawn presets/worktrees pending).
 - **P5** Split/Tiled/Focus views · `⌘K` palette — ✅.
-- **terminal** styled cell-grid renderer + keyboard→PTY input + live focused grid — ✅.
-- **next** OSC-133 blocks rendered in the UI (daemon emits them) · `@all` composer · worktree spawn · detach/reattach polish · live Claude-hook demo.
-- **P6** *(deferred)* inter-agent orchestration · remote/federation.
+- **terminal** styled cell-grid renderer + keyboard→PTY input + live focused grid + **scrollback** (mouse wheel) — ✅.
+- **composer** `@name`/`@all`/`@working` fan-out input · typeable palette · OSC-133 command-block indicator — ✅.
+- **worktrees** git-worktree-per-agent spawn (clean-only removal) — ✅.
+- **P6** inter-agent **pipelines** (spawn B after A finishes) + process-exit→Done — ✅ · remote/federation — *(future)*.
+- **next** render OSC-133 as full command blocks · terminal-history scroll depth · remote/federation · live real-`claude`-in-GUI demo (first-run onboarding handling).
 
 UI look & feel: see the mockups in `~/fleetterm-v2.html` (canonical) and the gallery
 `~/fleetterm-index.html`.
