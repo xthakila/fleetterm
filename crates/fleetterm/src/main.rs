@@ -169,6 +169,7 @@ impl FleetTermApp {
     // ── event handler ─────────────────────────────────────────────────────────
 
     fn apply(&mut self, ev: Event) {
+        let prev_focus = self.focused.clone();
         match ev {
             Event::Snapshot {
                 sessions,
@@ -277,6 +278,14 @@ impl FleetTermApp {
                     // PromptStart: just a prompt rendering marker — no stats change needed.
                     BlockMarker::PromptStart => {}
                 }
+            }
+        }
+        // Focus changed (auto-focus on snapshot/output, re-focus on removal) → request a
+        // fresh grid so the clean cell-grid renders instead of the raw-ANSI text fallback.
+        // (Card-clicks request a grid separately in render.)
+        if self.focused != prev_focus {
+            if let Some(id) = &self.focused {
+                let _ = self.requests.try_send(Request::RequestGrid(id.clone()));
             }
         }
     }
@@ -561,6 +570,54 @@ fn state_glyph_color(state: &State) -> u32 {
 
 /// A small pill button used in the title bar for view mode toggles.
 /// `active` controls whether it gets the highlighted background.
+/// Strip ANSI/VT escape sequences + stray control chars from a line, for the plain-text
+/// terminal fallback (shown only briefly before the styled cell-grid arrives). Without
+/// this, raw PTY bytes render escape codes as literal garbage.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.peek() {
+                Some('[') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        chars.next();
+                        if ('\x40'..='\x7e').contains(&n) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    while let Some(&n) = chars.peek() {
+                        if n == '\x07' {
+                            chars.next();
+                            break;
+                        }
+                        if n == '\x1b' {
+                            chars.next();
+                            if chars.peek() == Some(&'\\') {
+                                chars.next();
+                            }
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            },
+            '\r' => {}
+            c if (c as u32) < 0x20 && c != '\t' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn view_mode_chip(label: &'static str, active: bool) -> gpui::Div {
     div()
         .text_xs()
@@ -676,7 +733,7 @@ impl Render for FleetTermApp {
             .and_then(|id| self.term_text.get(id))
             .map(|t| {
                 t.lines()
-                    .map(|l| SharedString::from(l.to_owned()))
+                    .map(|l| SharedString::from(strip_ansi(l)))
                     .collect()
             })
             .unwrap_or_else(|| {
