@@ -27,7 +27,9 @@ fn main() {
         worktree_from: None,
         autonomy: Autonomy::Guarded,
         opening: if send_prompt {
-            Some("Run the bash command `ls` once with your Bash tool, then stop.".into())
+            Some(std::env::var("CAP_PROMPT").unwrap_or_else(|_| {
+                "Run the bash command `ls` once with your Bash tool, then stop.".into()
+            }))
         } else {
             None
         },
