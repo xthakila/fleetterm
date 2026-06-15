@@ -123,6 +123,13 @@ struct FleetTermApp {
     composer: String,
     /// GPUI focus handle for the composer bar (separate from the terminal handle).
     composer_focus: FocusHandle,
+    /// Dedicated focus handle for the TERMINAL pane. Must be distinct from the root's
+    /// handle (focus_handle) — sharing one made the root the focused element, so keys hit
+    /// the root's palette-only handler instead of the terminal's PTY forwarder.
+    term_focus: FocusHandle,
+    /// Whether we've focused the terminal once on startup (GPUI doesn't auto-focus a
+    /// Focusable handle — something must call focus(); we do it on the first render).
+    did_initial_focus: bool,
 
     // ── Bug-fix: PTY resize tracking ──────────────────────────────────────────
     /// Last (session, cols, rows) sent via Request::Resize, to avoid redundant sends.
@@ -162,6 +169,8 @@ impl FleetTermApp {
             blocks: HashMap::new(),
             composer: String::new(),
             composer_focus: cx.focus_handle(),
+            term_focus: cx.focus_handle(),
+            did_initial_focus: false,
             last_sent_size: None,
         }
     }
@@ -520,7 +529,9 @@ impl FleetTermApp {
 
 impl Focusable for FleetTermApp {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
-        self.focus_handle.clone()
+        // Default the window's focus to the TERMINAL so typing works immediately
+        // (the root keeps its own handle for actions like the ⌘K palette).
+        self.term_focus.clone()
     }
 }
 
@@ -643,6 +654,12 @@ fn view_mode_chip(label: &'static str, active: bool) -> gpui::Div {
 
 impl Render for FleetTermApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Focus the terminal once on startup so typing works without a click. GPUI does
+        // not auto-focus the Focusable handle; we must call focus() explicitly.
+        if !self.did_initial_focus {
+            self.term_focus.focus(window);
+            self.did_initial_focus = true;
+        }
         // ── Bug fix (B2): Resize the focused session's PTY to fit the pane. ──
         // Compute monospace cell metrics from the window's current text style.
         // This mirrors the exact calls in terminal.rs::request_layout so the grid
@@ -744,7 +761,8 @@ impl Render for FleetTermApp {
 
         let focused_id = self.focused.clone();
         let requests_tx = self.requests.clone();
-        let focus_handle = self.focus_handle.clone();
+        // The terminal pane + tile grids use the dedicated terminal focus handle.
+        let term_focus = self.term_focus.clone();
 
         // If there's a grid for the focused session, clone it for rendering.
         let focused_grid: Option<terminal::GridState> = self
@@ -922,18 +940,18 @@ impl Render for FleetTermApp {
             // Build the grid element (paints only; key handling is on the wrapping div).
             let grid_elem = terminal::GridElement {
                 grid,
-                focus_handle: focus_handle.clone(),
+                focus_handle: term_focus.clone(),
             };
             // Wrap in a focusable, key-handling div.
             // Clicking the terminal grabs keyboard focus so key events start flowing.
-            let fh_click = focus_handle.clone();
+            let fh_click = term_focus.clone();
             div()
                 .flex()
                 .flex_col()
                 .flex_1()
                 .bg(rgb(color::TERM))
                 .overflow_hidden()
-                .track_focus(&focus_handle)
+                .track_focus(&term_focus)
                 .on_scroll_wheel(cx.listener(FleetTermApp::on_term_scroll))
                 .key_context("Terminal")
                 .on_key_down(cx.listener(FleetTermApp::on_term_key_down))
@@ -1452,7 +1470,7 @@ impl Render for FleetTermApp {
                     // Otherwise show the last few lines of term_text.
                     let tile_content: gpui::AnyElement = {
                         if let Some(grid) = self.grids.get(&sid).cloned() {
-                            let fh = focus_handle.clone();
+                            let fh = term_focus.clone();
                             terminal::GridElement {
                                 grid,
                                 focus_handle: fh,
