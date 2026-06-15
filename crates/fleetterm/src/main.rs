@@ -324,6 +324,12 @@ impl FleetTermApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Let app shortcuts (⌘K / Ctrl-K palette) bubble to the action handler rather
+        // than being encoded as a control byte and sent to the PTY.
+        let m = &ev.keystroke.modifiers;
+        if (m.platform || m.control) && ev.keystroke.key == "k" {
+            return;
+        }
         let Some(ref session_id) = self.focused else {
             return;
         };

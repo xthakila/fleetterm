@@ -307,6 +307,7 @@ impl Daemon {
             let watch_reg = self.reg.clone();
             tokio::spawn(async move {
                 let interval = tokio::time::Duration::from_millis(80);
+                let mut last_sig = String::new();
                 loop {
                     tokio::time::sleep(interval).await;
 
@@ -315,14 +316,19 @@ impl Daemon {
                         break;
                     }
 
-                    // Only emit a grid if this session is the one being watched.
+                    // Push a grid for EVERY session whose screen changed — so all visible
+                    // panes (focused split + every tile) render via the clean cell grid,
+                    // never the raw-text fallback. The watched session is pushed every tick
+                    // regardless, so its cursor/scroll stay live.
                     let is_watched = {
                         let w = watch_daemon.watched.lock().unwrap();
                         w.as_ref() == Some(&watch_id)
                     };
-                    if !is_watched {
+                    let sig = watch_session.screen_text();
+                    if !is_watched && sig == last_sig {
                         continue;
                     }
+                    last_sig = sig;
 
                     let (cols, rows, cursor_col, cursor_row, cells) =
                         watch_session.grid_snapshot();
