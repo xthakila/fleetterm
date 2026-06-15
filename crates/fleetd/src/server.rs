@@ -20,6 +20,7 @@ pub async fn serve(daemon: Arc<Daemon>) -> Result<()> {
     }
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)?;
+    daemon.start_pipeline_watcher();
     tracing::info!("fleetd listening on {}", path.display());
 
     loop {
@@ -91,6 +92,7 @@ fn handle_request(daemon: &Arc<Daemon>, req: Request) {
                 daemon.reg.emit_error(format!("spawn failed: {e}"));
             }
         }
+        Request::SpawnAfter { after, spec } => daemon.spawn_after(after, spec),
         Request::Input { target, data } => daemon.input(&target, &data),
         Request::Decide {
             session,

@@ -170,6 +170,16 @@ impl PtySession {
         let _ = self.child.lock().unwrap().kill();
     }
 
+    /// True once the child process has exited (used to mark sessions Done + fire pipelines).
+    pub fn has_exited(&self) -> bool {
+        self.child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .map(|s| s.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn dims(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }

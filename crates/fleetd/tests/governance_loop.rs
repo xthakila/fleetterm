@@ -351,3 +351,54 @@ async fn watched_session_pushes_live_grid_updates() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// P6 inter-agent pipeline: spawn B once A finishes
+// ---------------------------------------------------------------------------
+
+fn shell_spec(name: &str, opening: &str) -> SpawnSpec {
+    SpawnSpec {
+        name: Some(name.into()),
+        tool: Tool::Shell,
+        model: None,
+        cwd: None,
+        worktree_from: None,
+        autonomy: Autonomy::Auto,
+        opening: Some(opening.into()),
+        env: vec![],
+    }
+}
+
+fn session_names(daemon: &Daemon) -> Vec<String> {
+    match daemon.reg.snapshot_event() {
+        Event::Snapshot { sessions, .. } => sessions.into_iter().map(|s| s.name).collect(),
+        _ => vec![],
+    }
+}
+
+#[tokio::test]
+async fn pipeline_spawns_dependent_after_predecessor_finishes() {
+    let (daemon, _sock, dir) = temp_daemon("pipeline");
+    daemon.start_pipeline_watcher();
+
+    // A: a shell told to exit immediately → its process ends → poller marks it Done.
+    let a = daemon.spawn(shell_spec("pipe-A", "exit")).expect("spawn A");
+    // Queue B to start only after A is Done.
+    daemon.spawn_after(a.clone(), shell_spec("pipe-B", "echo from B"));
+
+    // B must NOT exist yet.
+    assert!(!session_names(&daemon).iter().any(|n| n == "pipe-B"));
+
+    // Within a few seconds (poller detects A's exit, watcher fires B), B appears.
+    let mut appeared = false;
+    for _ in 0..100 {
+        if session_names(&daemon).iter().any(|n| n == "pipe-B") {
+            appeared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(appeared, "pipeline never spawned pipe-B after pipe-A finished");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

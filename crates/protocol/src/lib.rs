@@ -139,6 +139,9 @@ pub enum Request {
     /// Begin receiving [`Event`]s. The daemon replies with [`Event::Snapshot`] first.
     Subscribe,
     Spawn(SpawnSpec),
+    /// Inter-agent pipeline: spawn `spec` only once session `after` reaches `Done`
+    /// (it finishes / its process exits). The dependency fires once.
+    SpawnAfter { after: SessionId, spec: SpawnSpec },
     /// Write raw bytes to a session's PTY (keystrokes, a prompt, etc.).
     Input { target: Target, data: Vec<u8> },
     /// Resolve a pending decision.

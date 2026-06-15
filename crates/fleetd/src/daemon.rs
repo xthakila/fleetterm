@@ -30,6 +30,9 @@ pub struct Daemon {
     /// Populated in [`Daemon::spawn`] when `SpawnSpec::worktree_from` is set;
     /// consumed in [`Daemon::close`] for best-effort cleanup.
     worktrees: Mutex<HashMap<SessionId, (PathBuf, PathBuf)>>,
+    /// Inter-agent pipelines: specs waiting to spawn once a predecessor reaches `Done`.
+    /// Each entry is (predecessor session, spec to spawn); fired once then removed.
+    pending_pipelines: Mutex<Vec<(SessionId, SpawnSpec)>>,
 }
 
 // Larger default so a fresh terminal fills a typical pane before the UI sends an
@@ -47,7 +50,52 @@ impl Daemon {
             hook_bin,
             watched: Mutex::new(None),
             worktrees: Mutex::new(HashMap::new()),
+            pending_pipelines: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Queue an inter-agent pipeline: spawn `spec` once `after` reaches `Done`.
+    pub fn spawn_after(&self, after: SessionId, spec: SpawnSpec) {
+        self.pending_pipelines.lock().unwrap().push((after, spec));
+    }
+
+    /// Watch the fleet event stream; when a session reaches `Done`, fire any pipeline
+    /// specs that were waiting on it (each fires once). Call once at startup.
+    pub fn start_pipeline_watcher(self: &Arc<Self>) {
+        let daemon = self.clone();
+        let mut rx = self.reg.subscribe();
+        tokio::spawn(async move {
+            use protocol::Event;
+            loop {
+                match rx.recv().await {
+                    Ok(Event::SessionUpdate(s)) if matches!(s.state, State::Done) => {
+                        // Drain specs waiting on this session.
+                        let ready: Vec<SpawnSpec> = {
+                            let mut p = daemon.pending_pipelines.lock().unwrap();
+                            let mut ready = Vec::new();
+                            p.retain(|(after, spec)| {
+                                if *after == s.id {
+                                    ready.push(spec.clone());
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                            ready
+                        };
+                        for spec in ready {
+                            tracing::info!("pipeline: {} done → spawning {:?}", s.id, spec.name);
+                            if let Err(e) = daemon.spawn(spec) {
+                                daemon.reg.emit_error(format!("pipeline spawn failed: {e}"));
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
     }
 
     pub fn pty(&self, id: &SessionId) -> Option<Arc<PtySession>> {
@@ -276,6 +324,12 @@ impl Daemon {
 
                     // Stop polling if the session is gone from the registry.
                     if poll_reg.get(&poll_id).is_none() {
+                        break;
+                    }
+
+                    // Child exited → terminal Done (fires any waiting pipelines), stop polling.
+                    if poll_session.has_exited() {
+                        poll_reg.set_state(&poll_id, State::Done, "process exited");
                         break;
                     }
 
